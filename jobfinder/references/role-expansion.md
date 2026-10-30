@@ -63,7 +63,7 @@ python -m jobfinder.role_expansion --input configs/example.role-expansion.animat
 
 ## 后续搜索和匹配的交接边界
 
-词组供后续搜索逐词使用，或经确认渠道支持后用OR；不要把所有别名拼成必须同时命中的条件。关联记录使用group_id追溯来源。plan/extend-plan已通过--role-groups消费性质以筛选企业，不改变原role_keywords查询用词；当前每城10次默认与轮转遵循[预算契约](budget.md)。只使用ready组且能关联当前配置岗位词或explicit_inputs的组；未覆盖的当前岗位保留unclear，不用其他组代替。CLI输出role_context_hash绑定完整规范化词组，企业判断须引用此哈希，变化后重新判断。详情见[企业筛选契约](company-selection.md)。
+词组供后续搜索逐词使用，或经确认渠道支持后用OR；不要把所有别名拼成必须同时命中的条件。关联记录使用group_id追溯来源。plan/extend-plan已通过--role-groups消费性质以筛选企业，不改变原role_keywords查询用词；当前每城40次默认与轮转遵循[预算契约](budget.md)。只使用ready组且能关联当前配置岗位词或explicit_inputs的组；未覆盖的当前岗位保留unclear，不用其他组代替。CLI输出role_context_hash绑定完整规范化词组，企业判断须引用此哈希，变化后重新判断。详情见[企业筛选契约](company-selection.md)。
 
 相邻/待确认组不能无条件加入role_keywords，已核验的词也须结合具体岗位职责证据。现有evaluate仍只按原标题子串进行岗位维度匹配，无职责语义分类、排除词引擎或自动证据晋级。宽泛词可能误收无关标题，不能把结构校验或标题命中当作职责符合。
 

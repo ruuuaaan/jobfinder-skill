@@ -97,7 +97,7 @@ def merge_pool(catalog=None, knowledge=None, requested=()):
                 row['field_status'][field] = state
     catalog = catalog or {}
     origin = catalog.get('source_kind', 'enterprise_directory')
-    if origin not in ('enterprise_directory', 'listed_companies', 'knowledge_base'):
+    if origin not in ('enterprise_directory', 'listed_companies', 'knowledge_base', 'query_discovery'):
         raise ValueError('未知企业选择来源')
     for row in catalog.get('companies', []):
         add(row, origin)

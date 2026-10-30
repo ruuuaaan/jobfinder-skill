@@ -10,6 +10,105 @@ from .company_selection import select_companies
 from .role_expansion import RoleExpansion
 from .entries import entry_task
 
+OFFICIAL = 'official_career'
+MANUAL = 'manual_import'
+RESEARCH = 'research'
+BROWSE = 'browse_list'
+# 渠道检索方式：只用于生成可核对的查询标签，真正的城市参数在渠道契约里。
+CHANNEL_METHODS = {
+    'zhaopin': ('智联招聘', '站内搜索'),
+    'boss': ('BOSS直聘', '站内搜索'),
+    'liepin': ('猎聘', '站内搜索'),
+    '51job': ('前程无忧', '站内搜索'),
+    'linkedin': ('领英', '站内检索'),
+    'bendibao_web': ('本地宝网站', '站内检索'),
+    'bendibao_wechat': ('本地宝公众号', '公众号检索'),
+}
+
+# 列表页直读：平台渠道的主路径。
+# 站内搜索受登录态、虚拟滚动、反爬白屏影响，一屏只出十几张卡片；服务端渲染的职能
+# 分类页 / 城市聚合页一次能读出 20–40 条带薪资的岗位。只收录实测通过的站点与类目，
+# 未收录的渠道/城市/岗位词自动退回站内搜索——不猜 URL，猜出来的链接会成为假证据。
+BROWSE_CITIES = {
+    '上海': {'slug': 'shanghai', 'code': 'sh'},
+}
+
+BROWSE_CATALOG = {
+    '51job': {
+        'label': '前程无忧职能分类页',
+        'url': 'https://jobs.51job.com/{slug}/{category}/',
+        'page_url': '{base}p{page}/',
+        'pages': 5,
+        'categories': [
+            (('薪酬',), 'xinzifulijingli', '薪酬福利经理'),
+        ],
+    },
+    'liepin': {
+        'label': '猎聘城市聚合页',
+        'url': 'https://www.liepin.com/city-{code}/career/{category}/',
+        'page_url': None,          # 虚拟滚动，只有第一页可读
+        'pages': 1,
+        'categories': [
+            (('薪酬', '总监'), 'xinchoujixiaozongjian', '薪酬绩效总监'),
+        ],
+    },
+}
+
+
+def browse_category(channel, role):
+    """按岗位词命中已实测的类目；未命中返回 None（退回站内搜索）。"""
+    target = BROWSE_CATALOG.get(channel)
+    if not target:
+        return None
+    for keywords, slug, name in target['categories']:
+        if all(k in role for k in keywords):
+            return slug, name
+    return None
+
+
+def browse_rows(city, roles, channels):
+    """展开列表页任务：一页一条任务，页号外层循环，让预算先覆盖到每个岗位词。
+
+    同一渠道下多个岗位词命中同一类目时合并成一条（covers_roles 留痕），
+    否则会生成两条完全相同的 URL 任务。
+    """
+    meta = BROWSE_CITIES.get(city)
+    if not meta:
+        return []
+    rows = []
+    for channel in channels:
+        target = BROWSE_CATALOG.get(channel)
+        if not target:
+            continue
+        merged = {}
+        for role in roles:
+            hit = browse_category(channel, role)
+            if not hit:
+                continue
+            base = target['url'].format(slug=meta['slug'], code=meta['code'], category=hit[0])
+            row = merged.setdefault(base, {'base': base, 'role': role, 'covers': [],
+                                           'category': hit[1], 'label': target['label']})
+            row['covers'].append(role)
+        for page in range(1, target['pages'] + 1):
+            for row in merged.values():
+                base = row['base']
+                url = (target['page_url'].format(base=base, page=page)
+                       if target['page_url'] and page > 1 else base)
+                rows.append(dict(route=BROWSE, role=row['role'], channel=channel, query=url,
+                                 browse_url=base, browse_page=page, browse_label=row['label'],
+                                 covers_roles=list(row['covers']), company=None, exhausted=False))
+    return rows
+
+
+def search_channels(config):
+    """除官网与人工导入以外、需要在计划里单独占预算的检索渠道。"""
+    return [c for c in config.sources if c not in (OFFICIAL, MANUAL)]
+
+
+def channel_query(channel, city, role, hiring_type):
+    label, method = CHANNEL_METHODS.get(channel, (channel, '线上检索'))
+    return f'{label} {method} {city} {role} {hiring_type}'.replace('  ', ' ').strip()
+
 
 def fingerprint(config):
     from .spec import matching_config
@@ -38,14 +137,38 @@ def build_plan(config, catalog=None, *, role_groups=None, company_assessments=No
     if role_groups is not None:
         role_groups = RoleExpansion.model_validate(role_groups).model_dump()
     selected_by_city, selection = select_companies(config,catalog,role_groups,company_assessments,knowledge,requested_companies)
+    other_channels = search_channels(config)
     for city in cities(config):
         selected = selected_by_city[city]
         local = []
+        # 1. 官网渠道的岗位查询词任务：每个岗位词一条，不含目录/名录类查询。
+        #    官网不使用"监管企业名录"这类目录页：目录页不是岗位来源，也拿不到企业是否在招；
+        #    企业名单一律从本渠道查询词结果里提取（official_channel.build_catalog）。
         for role in discovery_terms(config):
             for hiring_type in recruitment_terms(config.recruitment_type) or [""]:
-                local.append(("direct", role, f'{city} {role} {hiring_type} 招聘 官网 工作地点'.replace("  ", " "), None))
-        scope = " ".join(config.company_scope_keywords)
-        local.append(("directory", "", f'{city} {scope} 机构 企业 名单 官方' if scope else f'{city} 国资委 监管企业 名录 官方', None))
+                local.append(dict(route="direct", role=role, channel=OFFICIAL,
+                                  query=f'{city} {role} {hiring_type} 招聘 官网 工作地点'.replace("  ", " "),
+                                  company=None, exhausted=False))
+        role_pairs = [(role, hiring_type) for role in discovery_terms(config)
+                      for hiring_type in (recruitment_terms(config.recruitment_type) or [""])]
+        # 2. 官网渠道的研究型检索任务：交给 domain_search，产出"正在招聘的企业"名单。
+        #    与 direct 查询词任务并列，属于官网渠道自己的发现任务；平台渠道任务产出的
+        #    企业仍然不进名单（见 official_channel._reject_reason）。
+        for role, hiring_type in role_pairs:
+            local.append(dict(route=RESEARCH, role=role, channel=OFFICIAL,
+                              query=f'{city} {role} {hiring_type} 正在招聘的企业 名单 官网招聘'.replace("  ", " "),
+                              company=None, exhausted=False))
+        # 3. 平台渠道：列表页直读是主路径，一页一条任务（便于按次对账）。
+        local.extend(browse_rows(city, [role for role, _ in role_pairs], other_channels))
+        # 3b. 没有实测列表页的渠道/岗位词，退回站内搜索，不硬编 URL。
+        for role, hiring_type in role_pairs:
+            for channel in other_channels:
+                if browse_category(channel, role):
+                    continue
+                local.append(dict(route="channel_search", role=role, channel=channel,
+                                  query=channel_query(channel, city, role, hiring_type),
+                                  company=None, exhausted=False))
+        # 4. 企业任务（企业库/名单指定）：仍归官网渠道，是产出不是线索来源。
         # Never filter employers by headquarters/registration; outside employers can hire here.
         for company in selected:
             name = company["legal_name"]
@@ -54,20 +177,53 @@ def build_plan(config, catalog=None, *, role_groups=None, company_assessments=No
                 entry_tasks.append(reuse)
                 continue
             term = " ".join(config.role_keywords) if config.role_mode == "keywords" else ""
-            local.append(("enterprise", term, f'{name} {city} {term} 招聘'.replace("  ", " "), name))
-        for index, (route, role, query, company) in enumerate(local):
-            employer = next((c for c in selected if c['legal_name']==company), {})
-            tasks.append(dict(task_id=f'{city}-{index+1}', target_city=city, role_keyword=role,
-                              query=query, route=route, company=company, company_source=employer.get('source_url'),
+            local.append(dict(route="enterprise", role=term, channel=OFFICIAL,
+                              query=f'{name} {city} {term} 招聘'.replace("  ", " "), company=name,
+                              exhausted=bool(company.get('company_budget_exhausted'))))
+        # 预算：先按每渠道上限（官网优先分配时由 base_allocation 给出），再按每城总量。
+        channel_caps = (spec.search_budget.per_city_channel or {}).get(city, {})
+        city_cap = config.budget.city_searches(city)
+        city_used, channel_used = 0, {}
+        for index, row in enumerate(local):
+            cap = channel_caps.get(row["channel"])
+            room = city_used < city_cap and (cap is None or channel_used.get(row["channel"], 0) < cap)
+            if room and not row["exhausted"]:
+                city_used += 1
+                channel_used[row["channel"]] = channel_used.get(row["channel"], 0) + 1
+            employer = next((c for c in selected if c['legal_name'] == row["company"]), {})
+            if row["company"]:
+                reason = 'no_reusable_entry'
+            elif row["route"] == RESEARCH:
+                reason = 'official_research_query'
+            elif row["route"] == BROWSE:
+                reason = 'browse_list_first_page' if row.get("browse_page") == 1 else 'browse_list_paging'
+            elif row["channel"] == OFFICIAL:
+                reason = 'configured_discovery_query'
+            else:
+                reason = 'configured_channel_search'
+            tasks.append(dict(task_id=f'{city}-{index+1}', target_city=city, role_keyword=row["role"],
+                              query=row["query"], route=row["route"], channel=row["channel"],
+                              **{k: row[k] for k in ("browse_url", "browse_page", "browse_label", "covers_roles") if k in row},
+                              company=row["company"], company_source=employer.get('source_url'),
                               company_selection=employer.get('selection_decision'),
-                              reason='no_reusable_entry' if company else 'configured_discovery_query',
-                              status="planned" if index < config.budget.city_searches(city) and not employer.get('company_budget_exhausted') else "budget_exhausted",
+                              reason=reason,
+                              status="planned" if room and not row["exhausted"] else "budget_exhausted",
                               executed_at=None, search_tool=None, candidate_count=0))
+    channel_plan = {}
+    for task in tasks:
+        row = channel_plan.setdefault(task["channel"], {"routes": {}, "planned": 0, "budget_exhausted": 0})
+        row["routes"][task["route"]] = row["routes"].get(task["route"], 0) + 1
+        if task["status"] in ("planned", "budget_exhausted"):
+            row[task["status"]] += 1
     return dict(plan_id=str(uuid.uuid4()), created_at=now(), config_fingerprint=fingerprint(config),
                 effective_config=config.model_dump(mode="json"), effective_search_spec=spec.model_dump(mode='json'), rule_version=config.rules_version,
                 synonym_expansions=[], tasks=tasks, entry_tasks=entry_tasks, catalog_scope=(catalog or {}).get("scope"),
                 role_groups=role_groups, company_assessments=company_assessments,
                 requested_companies=list(requested_companies), company_selection=selection,
+                channel_plan=channel_plan,
+                browse_coverage={c: {"cities": sorted(BROWSE_CITIES), "categories": [x[2] for x in v["categories"]],
+                                     "pages": v["pages"], "page_url": v["page_url"]}
+                                 for c, v in BROWSE_CATALOG.items()},
                 coverage="逐城市小预算候选发现，不代表城市或全国完整覆盖")
 
 
@@ -164,7 +320,7 @@ def extend_plan(config, plan, catalog, *, role_groups=None, company_assessments=
             if query in plan.get('query_history',[]) or any(t['query']==query for t in local):
                 continue
             remaining = config.budget.city_searches(city)-plan.get('budget_used',{}).get('searches',{}).get(city,0)
-            plan['tasks'].append(dict(task_id=f'{city}-{len(local)+1}',target_city=city,role_keyword=term,query=query,route='announcement_reverse' if company.get('discovery_route')=='announcement_reverse' else 'enterprise',company=company['legal_name'],company_source=company.get('source_url'),company_selection=company['selection_decision'],reason='no_reusable_entry',created_at=now(),status='planned' if len(local)<remaining and not company.get('company_budget_exhausted') else 'budget_exhausted',executed_at=None,search_tool=None,candidate_count=0))
+            plan['tasks'].append(dict(task_id=f'{city}-{len(local)+1}',target_city=city,role_keyword=term,query=query,route='announcement_reverse' if company.get('discovery_route')=='announcement_reverse' else 'enterprise',channel='official_career',company=company['legal_name'],company_source=company.get('source_url'),company_selection=company['selection_decision'],reason='no_reusable_entry',created_at=now(),status='planned' if len(local)<remaining and not company.get('company_budget_exhausted') else 'budget_exhausted',executed_at=None,search_tool=None,candidate_count=0))
     plan.setdefault('company_selection_history', []).append(selection)
     plan['requested_companies'] = requested_companies
     plan['company_assessments'] = company_assessments

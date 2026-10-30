@@ -18,7 +18,7 @@
   ],
   "budget": {
     "requests": null,
-    "searches_per_city": 10,
+    "searches_per_city": 40,
     "companies_per_city": null,
     "timeout": 12,
     "retries": 0,

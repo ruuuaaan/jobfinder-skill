@@ -29,7 +29,7 @@ Candidate.role_decisions每项包含url、decision（related/out_of_scope）、r
 
 ## 进度与预算
 
-默认每城10次实际搜索，企业/HTTP总量null不限；按城市及候选轮流推进一个列表/详情步骤，每步、开始和异常退出保存进度。单步所需robots、重试、导航仍有限。浏览器遵循同样范围、轮转与停止规则，但没有接入Python自动计量或恢复；实际请求未知时记录“未计量”，有限预算无法核实时暂停。详见[预算契约](budget.md)。
+默认每城40次实际搜索，企业/HTTP总量null不限；按城市及候选轮流推进一个列表/详情步骤，每步、开始和异常退出保存进度。单步所需robots、重试、导航仍有限。浏览器遵循同样范围、轮转与停止规则，但没有接入Python自动计量或恢复；实际请求未知时记录“未计量”，有限预算无法核实时暂停。详见[预算契约](budget.md)。
 
 每次输出traversal-progress.json（traversal-run-1），包含配置/规则指纹、states、既有jobs和budget_used。每个范围保存candidate、筛选分支、visited（URL/类型/哈希/快照/时间）、pending分页和详情、岗位ID、原文岗位、终止证据、异常原因、跳过详情依据及完成状态。所有失败和未审核链接保留；不会将其算已访问成功。
 

@@ -32,13 +32,13 @@ Python复用库中有原文证据的精确岗位名称（主词/别名完全匹�
 python -m jobfinder plan --config <本轮配置> --role-groups <词组JSON> --catalog <完整名单JSON> --catalog-source listed_companies --knowledge-base data/resources/companies.sqlite3 --company-assessments <企业判断JSON> --output data/discovery/<新计划>.json
 ```
 
-名录用enterprise_directory，上市名单用listed_companies；知识库可单独用--knowledge-base（SQLite或完整JSON快照）。三个来源共用筛选；读取SQLite不建库、不写快照。导入政府HTML默认解析已提供页面全部可识别企业；--limit仅为明确抽样，抽样不等于完成相关性筛选。
+名录用enterprise_directory，上市名单用listed_companies，官网渠道从岗位查询词结果生成的名录用query_discovery；知识库可单独用--knowledge-base（SQLite或完整JSON快照）。三个来源共用筛选；读取SQLite不建库、不写快照。导入政府HTML默认解析已提供页面全部可识别企业；--limit仅为明确抽样，抽样不等于完成相关性筛选。
 
 用户明确指定企业通过重复--company传入，不从网页或名单标志推断。指定企业优先保留，超企业数量限制仍生成budget_exhausted入口。其余依次为：直接岗位证据、业务关联且有城市机构、通用职能且有城市机构、业务关联但城市待查、其他待核查；同档按规范化名称排序。冲突不用于排除。先评估完整输入再限额；未选中记录deferred_company_limit，不等于不相关。
 
 plan.company_selection保存全部逐城/逐组状态、理由、证据、来源、role_context_hash和输入摘要哈希；任务关联选择决定。extend-plan沿用岗位性质，只选新企业并扣除已计划企业数，不重排已执行任务；新报告留在company_selection_history。企业线索显式target_cities仅限制本批发现范围，不证明其他城市无岗位。
 
-岗位查询、目录查询及搜索预算不变，执行后才算搜索；自动公告模板保持删除。访问策略不放宽。岗位MATCH仍由原evaluate产生。合成完整示例见configs/example.company-relevance.json，包含配置、词组、名单、判断和资料，仅用于结构与离线验收。
+岗位查询及搜索预算不变，执行后才算搜索；自动公告模板保持删除。访问策略不放宽。岗位MATCH仍由原evaluate产生。合成完整示例见configs/example.company-relevance.json，包含配置、词组、名单、判断和资料，仅用于结构与离线验收。
 
 ## 选择后的入口读取（规则3.6）
 

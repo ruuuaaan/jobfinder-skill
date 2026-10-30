@@ -90,7 +90,7 @@ class SalaryConfig(Model):
 
 
 class Budget(Model):
-    searches_per_city: int = Field(default=10, ge=1, le=30)
+    searches_per_city: int = Field(default=40, ge=1, le=200)
     per_city: dict[str,int] = Field(default_factory=dict)
     companies_per_city: int | None = Field(default=None, ge=1, le=100)
     requests: int | None = Field(default=None, ge=0, le=100)

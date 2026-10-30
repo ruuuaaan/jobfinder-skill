@@ -54,6 +54,8 @@ candidates 每项至少包含 query、url、title、discovered_at、source_chann
 
 没有适配器时不要手工编造 browser-run.json 的成功轨迹。可以保留平台卡片为 REVIEW；遇登录、验证码或拒绝按宿主规则交给用户处理，不绕过。
 
+首次在本机启用浏览器通道的开关入口、扩展安装、自检方法和证据等级，见[首次安装配置清单](setup.md)。未完成配置时，登录态与 JavaScript 空壳渠道记 `needs_help` 并继续其它可访问渠道，不写成"零岗位"；登录态证据记 `browser_visible_dom`，不能冒充 Python HTTP 成功或官方完整详情。
+
 ## 已验证范围
 
 自动化验证包括独立目录安装、普通 Python 子进程调用、通用查询回执、离线导出及旧回执兼容。没有安装并逐一操作所有第三方 agent；它们的技能发现、工具权限和浏览器接口需在首次使用时确认。Skill 不附带模型 API，也不提供独立联网后台；需要本机网页服务请选择 Agent 版。

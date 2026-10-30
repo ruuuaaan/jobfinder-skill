@@ -42,6 +42,18 @@ def main():
             p.add_argument('--knowledge-base',help='只读企业SQLite库或完整JSON快照')
             p.add_argument('--catalog-source',choices=['enterprise_directory','listed_companies','knowledge_base'])
             p.add_argument('--company',action='append',help='用户明确指定的企业，保留查询入口；可重复')
+    p=commands.add_parser("official-catalog",help="官网渠道：从岗位查询词搜索结果提取企业，形成独立名单")
+    p.add_argument("--plan",required=True,help="本渠道已执行的查询计划")
+    p.add_argument("--receipt",required=True,help="本渠道查询回执（含 candidates.task_ids）")
+    p.add_argument("--output",required=True)
+    p.add_argument("--limit",type=int,help="仅显式抽样时使用；默认按出现顺序收录全部可识别企业")
+    p=commands.add_parser("official-plan",help="官网渠道：按名单出现顺序为每家企业生成官网检索任务")
+    p.add_argument("--config",required=True)
+    p.add_argument("--plan",required=True,help="含官网渠道查询任务的计划")
+    p.add_argument("--catalog",required=True,help="official-catalog 生成的企业名单")
+    p.add_argument("--output",required=True)
+    p.add_argument("--city",action="append",help="只扩展指定城市，可重复")
+    p.add_argument("--role",action="append",help="覆盖岗位关键词，可重复")
     p=commands.add_parser("import-companies")
     p.add_argument("--input",required=True)
     p.add_argument("--source-url",required=True)
@@ -78,6 +90,18 @@ def main():
             save_new_json(local_path(args.output),result)
             print(json.dumps({"companies":len(result["companies"]),"output":str(local_path(args.output))},ensure_ascii=False))
             return 0
+        if args.command=='official-catalog':
+            if args.limit is not None and not 1<=args.limit<=100:
+                raise ValueError('名单样本数量必须1—100')
+            from .official_channel import build_catalog
+            catalog=build_catalog(json.loads(local_path(args.plan).read_text(encoding='utf-8-sig')),
+                                  json.loads(local_path(args.receipt).read_text(encoding='utf-8-sig')),
+                                  limit=args.limit)
+            save_new_json(local_path(args.output),catalog)
+            print(json.dumps({'companies':len(catalog['companies']),'excluded':len(catalog['excluded']),
+                              'order':[c['legal_name'] for c in catalog['companies']],
+                              'output':str(local_path(args.output))},ensure_ascii=False))
+            return 0
         raw=json.loads(local_path(args.config).read_text(encoding="utf-8-sig"))
         overrides={}
         if args.city is not None:
@@ -98,6 +122,19 @@ def main():
                 if 'role_keywords' in overrides:adjusted['job_scope'].update(mode='keywords',terms=overrides['role_keywords'])
                 config=matching_config(adjusted)
             else:config=SearchConfig.model_validate(config.model_dump(mode='json') | overrides)
+        if args.command=='official-plan':
+            from .official_channel import plan_official_tasks
+            result=plan_official_tasks(config,
+                                       json.loads(local_path(args.plan).read_text(encoding='utf-8-sig')),
+                                       json.loads(local_path(args.catalog).read_text(encoding='utf-8-sig')))
+            save_new_json(local_path(args.output),result)
+            print(json.dumps({'status':'awaiting_company_searches',
+                              'added':result['official_channel']['added_tasks'],
+                              'planned':result['official_channel']['planned'],
+                              'budget_exhausted':result['official_channel']['budget_exhausted'],
+                              'tasks':[t for t in result['tasks'] if t.get('reason')=='official_channel_company_search'],
+                              'output':str(local_path(args.output))},ensure_ascii=False))
+            return 0
         effective=effective_config(config,args.config,overrides)
         effective["raw_input"]={"config":raw,"overrides":overrides}
         print(json.dumps({"effective_config":effective},ensure_ascii=False))

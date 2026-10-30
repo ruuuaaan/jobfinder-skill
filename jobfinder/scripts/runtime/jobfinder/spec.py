@@ -89,7 +89,7 @@ class JobSearchSpec(Model):
             raise ValueError('预算必须对应本轮城市和渠道')
         from .search_budget import PRIORITY, validate_allocation, base_allocation
         validate_allocation(self.target_locations,self.channels,self.search_budget.per_city,self.search_budget.per_channel,self.search_budget.allocation_policy)
-        self.search_budget.per_city_channel=(base_allocation(self.target_locations,self.channels,self.search_budget.per_city)
+        self.search_budget.per_city_channel=(base_allocation(self.target_locations,self.channels,self.search_budget.per_city,self.search_budget.per_channel)
             if self.search_budget.allocation_policy==PRIORITY else {})
         if self.rules_version==LEGACY_RULES_VERSION:
             if self.legacy_matching_config is None or self.candidate_education is not None:
