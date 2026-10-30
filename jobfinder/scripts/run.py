@@ -7,6 +7,10 @@ import sys
 
 
 def main():
+    # Redirected output on English Windows otherwise defaults to a legacy codec.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='backslashreplace')
     parser = argparse.ArgumentParser(description='JobFinder portable skill runner')
     parser.add_argument('--workspace', required=True, help='Writable task directory, separate from this skill')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='init, or a jobfinder CLI command')
