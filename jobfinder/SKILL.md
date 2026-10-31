@@ -3,7 +3,7 @@ name: jobfinder
 description: 检索中国大陆指定城市的岗位，复用企业官网、招聘站列表页直读与站内搜索、人才服务平台、本地宝网站及公众号等已实测渠道的方法，核验岗位原文、学历门槛与投递入口，维护企业资源库并导出Excel。支持新检索、刷新和公告反查企业；不自动投递。
 license: MIT
 metadata:
-  version: "0.4.0"
+  version: "0.5.0"
   compatibility: "Python 3.11+; file and terminal tools; host search/browser for live collection."
 ---
 
@@ -35,7 +35,7 @@ metadata:
 - **B 联网搜索**：本技能自身不联网搜索，搜索由宿主执行并按回执交回核心。缺这一步只能跑离线样例，或处理用户直接提供的链接（记 `provided_links`）。
 - **C 浏览器控制与扩展**：智联未登录时薪资显示"-元"、BOSS 返回 JavaScript 空壳，这类登录态与动态页面必须靠宿主浏览器读取。配置入口是宿主**设置 → Agent → 浏览器控制**，并安装对应浏览器扩展；登录由用户完成，助手不读 Cookie、不代填凭据、不绕验证码。
 
-未配置 C 时，登录态与 JS 渠道记 `needs_help` 并继续其它可访问渠道，不写成"零结果"。登录态读到的是 `browser_visible_dom`，不能记成 Python HTTP 成功。首次真实任务建议先按"一城 + 一词 + 一渠道"跑最小样本，确认读通再放量。
+未配置 C 时，控制器把该平台记为 `blocked`（附能力检测证据）并继续其它可访问渠道，不写成"零结果"，也不影响最终判定里的缺口记录。登录态读到的是 `browser_visible_dom`，不能记成 Python HTTP 成功。首次真实任务建议先按"一城 + 一词 + 一渠道"跑最小样本，确认读通再放量。
 
 ## 输入
 
@@ -82,36 +82,70 @@ metadata:
 
 Python处理已观察且获准的链接分页与既有接口；动态DOM列表、iframe和新标签页按[浏览器采集流程](references/browser-collection.md)使用共用脚本执行，并以process-browser接入核心。无URL的滚动虚拟列表仍需按浏览器协议观察，不声称所有网站均已适配。未适配的站点按通用网页流程读取，不从脚本猜测或调用接口。traversal-progress.json保留已读页、原文岗位、待处理分页/详情和剩余预算；使用resume-traversal继续，默认remaining，明确新一轮才用--budget-mode new_run。
 
-## 检索开始前：打开渠道页并登录（必做）
+## 运行控制器：阶段顺序与登录前置（唯一主路径）
 
-真实检索（新检索、refresh、跨渠道补搜）开始前，先完成一次渠道准备，再发出第一条查询。**不要先搜再问登录**：未登录状态下的结果会把薪资隐藏成"-元"或返回 JS 空壳，等于白跑一轮。
+**不要自己挑渠道、也不要先搜再问登录。**每轮新检索都由控制器冻结范围并按固定阶段顺序放行：
 
-1. 按本次要用的渠道，在宿主浏览器里各开一个标签页，停在登录入口，然后请用户自行登录：
+```
+official（企业官网） → recruitment（招聘平台） → bendibao_web（本地宝网站） → public_accounts（公众号）
+```
 
-   | 渠道 | 打开这个地址 | 登录成功的标志 |
-   |---|---|---|
-   | 智联 | `https://passport.zhaopin.com/login` | 跳转到 `www.zhaopin.com/jobs/`，右上角显示用户名 |
-   | BOSS | `https://www.zhipin.com/web/user/?ka=header-login` | 跳转到 `www.zhipin.com/web/geek/jobs`，且停在"我要找工作" |
-   | 猎聘 | `https://passport.liepin.com/` | 跳转到 `c.liepin.com`（我的首页） |
-   | 前程无忧 | `https://login.51job.com/login.php` | 跳转到 `we.51job.com/pc/my/myjob`（我的51Job） |
+执行循环只有一条：**请求动作 → 用宿主工具执行 → 提交回执**。
 
-2. 登录后做一次实证校验，不能只看"看起来登录了"：在该渠道搜一个词，检查**薪资是否显示实数**。智联未登录时薪资显示"-元"，BOSS 未登录时整页是空壳——这两个信号最能证明登录态是否真的传到了助手侧。
-3. 用户登录期间保持标签页不刷新、不跳转；遇到滑块、图形验证码、二次验证，停下来等用户过完，不绕过、不代过。
-4. 用户明确表示不登录、或某渠道登录失败时：该渠道记 `needs_help` 或 `not_run`，继续其他渠道，并按渠道分别报告。**不得用已登录渠道的结果冒充全部渠道已执行。**
-5. 登录态绑定这个浏览器窗口：用户关闭窗口或退出登录后立即失效。跨轮次续跑前重新确认一次，不要假设上一轮的登录还在。
+```bash
+python -m jobfinder start-run --config <配置> --plan <计划>          # 冻结城市/岗位/渠道/阶段顺序，得到 run_id
+python -m jobfinder next-action --run <run_id>                      # 当前唯一合法的下一动作
+python -m jobfinder record-action --run <run_id> --input <回执JSON>  # 提交实际执行结果
+python -m jobfinder close-stage --run <run_id>                      # 阶段内任务都有处置后才可关闭
+python -m jobfinder finalize --run <run_id>                         # 统一判定整轮完成度
+```
 
-具体操作顺序、各渠道搜索入口参数和已知坑位见[已验证渠道的方法与边界](references/verified-channels.md)；浏览器能力本身未配置时先按[首次安装配置](references/setup.md)处理。
+`next-action` 只会返回以下几种动作之一，按它执行即可，不要跳步：
+
+| 动作 | 含义与处理 |
+|---|---|
+| `open_auth_tab` | 该平台在业务搜索前必须先开页核验会话；打开 `login_url`，保留同一标签页 |
+| `wait_user_auth` | 已开页等用户登录；用户完成后用 `auth_probe` 提交核验，不要自填"已登录" |
+| `search_task` / `read_entry` | 执行该任务（查询词或官网入口读取），完成后提交 `search` 回执 |
+| `close_stage` | 当前阶段已无可执行任务，提交 `close-stage` 推进 |
+| `channel_blocked` | 该平台已记录受阻；按 `skip`/`blocked` 处置后继续其他渠道 |
+| `await_resolution` | 仍有未处置任务但无法继续，需重试、补证据或由用户明确跳过 |
+| `finalize` | 所有阶段处理完毕，进入整轮判定 |
+
+**阶段顺序是程序控制的**：当前阶段未关闭时，后一阶段的任务回执会被直接拒绝，并返回当前允许的动作。官网阶段发现的派生企业任务（`official-catalog` → `official-plan`、`extend-plan`、`follow-up-plan`）**并入官网阶段**，不能推到其他渠道之后再处理。
+
+**登录前置**（`platform_auth_policy=required`，新多渠道任务默认）：
+
+1. 对启用的每个招聘平台，业务搜索前先 `open_auth_tab`，由**用户本人**在可见浏览器里登录；
+2. 核验由核心自己做：提交页面快照文件，核心读取快照、自己算哈希、自己匹配该平台的账号专属 UI 标记，并检查没有登录表单/验证码遮罩。**"薪资显示数字"不算登录证据**，它只是内容完整性；
+3. 认证记录绑定 `run_id + channel + browser_context_id + tab_id + checked_at`：换了平台、换了浏览器会话、标签页被关掉或超过 120 分钟都要重新核验；
+4. 验过的是**用户可见浏览器会话**，不能当成无状态 Python HTTP 请求也已登录；核心 HTTP 读取仍是匿名访问；
+5. 用户拒绝登录或平台确实受阻：记 `skipped_by_user`（须用户明确确认）或 `blocked`（须能力检测/访问失败证据），继续其余渠道，**不得记成零岗位或搜索完成**；
+6. 不保存密码、Cookie、令牌，不绕过验证码与访问限制。`public_only` 是显式的匿名读取模式，只能由用户选择，助手不得为了方便自行切换。
+
+**完成度由 finalizer 统一判定**（`finalize` 输出 `verdict`）：
+
+| 判定 | 含义 |
+|---|---|
+| `COMPLETE` | 声明范围内的阶段与渠道都有可核验处置，无未解释遗漏 |
+| `PARTIAL` | 各阶段已处置，但存在受阻、用户跳过或预算缺口；**可导出但必须标注未完成渠道** |
+| `WAITING_USER` | 仍有等待用户登录或待办任务 |
+| `IN_PROGRESS` | 仍有可执行任务未跑完 |
+
+分批回执随时可以入库、随时可以导出（`new-search --run <run_id>` 会把回执并入同一运行）。**"命令成功 + 生成 Excel"不等于整轮完成**：导出文件里带"运行状态与完成度"表和 `verdict`，阶段性导出会显式写明缺口与下一动作。回执只能提交结果字段，`task_id/query/channel/route/stage` 等计划字段不可覆盖。
+
+**能力边界**：以上约束只对经过这些命令的动作生效。宿主若绕过控制器、自己直接写表或直接调用匹配/导出函数，控制器拦不住；那样的产物没有 `run_id` 与完成度区块，应当作"未经控制器的结果"，不能宣称已完成检索。宿主适配接口（`detect_capabilities / open_visible_tab / read_dom / handoff_to_user / inspect_session / resume`）见[宿主兼容说明](references/host-compatibility.md)，各字段与状态机见[运行控制器协议](references/workflow.md)。
 
 ## 新检索
 
 1. 保存本次配置。运行 `python -m jobfinder validate-config --config <配置>`，检查有效值及来源。CLI --city/--role 可重复，覆盖配置对应列表。
 2. `python -m jobfinder plan --config <配置> --role-groups <词组JSON> --output data/discovery/<新计划>.json`。选企业时传 `--catalog <完整名单JSON> --catalog-source enterprise_directory`（上市公司名单用listed_companies）、`--knowledge-base data/resources/companies.sqlite3`及`--company-assessments <本轮企业判断JSON>`；可只用其中一种企业来源。用户明确指定企业用可重复的`--company`。每城按**渠道 × 岗位词**生成任务：官网渠道每个岗位词生成两条发现任务——一条岗位查询词任务（`route=direct`）和一条研究型检索任务（`route=research`，交给 `domain_search` 产企业名单）；其余已选渠道（智联/猎聘/BOSS/前程无忧/本地宝/领英等）优先生成**列表页直读**任务（`route=browse_list`，一页一条，`query` 即该页 URL，带 `browse_url`/`browse_page`/`covers_roles`），只有该渠道/城市/岗位词没有实测类目时才退回站内检索任务（`route=channel_search`）；平台渠道因此有自己的 `task_id`、独立占本渠道预算，超出渠道额度的任务标 `budget_exhausted` 不删行。**不再生成"监管企业名录/机构名单"类目录查询**；官网渠道的企业名单从本渠道查询结果里提取（见第4步）。筛选后先匹配已有入口，生成entry_tasks读取任务，无入口才生成企业合并查询；company_selection记录每项状态/理由/证据和限额结果。用户指定企业保留入口，超过限额标budget_exhausted。独立公告模板保持删除，预算按保存后的有效条件执行。3.9 旧配置/计划沿用原指纹；新条件使用 4.0 新计划，不修改旧指纹，不静默升级历史任务。
-3. 用当前可用且获准的搜索工具执行计划中 planned 任务。优先可用实时搜索；工具不暴露索引/实时模式时如实记 not_exposed，不能声称已确认实时索引，不能关闭沙箱/扩大权限。Python不能调用会话内部搜索；独立服务未配置时保持 unconfigured。每城搜索次数不超过 effective_search_spec.search_budget.per_city；旧配置沿用 budget.searches_per_city。服务失败只影响本查询：在已启用、已配置的服务内有限重试/回退，每次真实尝试计数；继续其他查询及已读页面，不因一次搜索失败暂停整轮。网页版执行细则由 jobfinder_web/search_execution.py 和保存的 provider_policy 控制；宿主 agent 手动工具执行也须逐次记账，不冒充自动熔断。
+3. `start-run` 冻结本轮范围，然后**只按 `next-action` 返回的动作执行**计划任务（不要自己从计划里挑渠道，也不要先搜再补登录）。当前阶段未关闭时，后一阶段的任务回执会被拒绝。优先可用实时搜索；工具不暴露索引/实时模式时如实记 not_exposed，不能声称已确认实时索引，不能关闭沙箱/扩大权限。Python不能调用会话内部搜索；独立服务未配置时保持 unconfigured。每城搜索次数不超过 effective_search_spec.search_budget.per_city；旧配置沿用 budget.searches_per_city。服务失败只影响本查询：在已启用、已配置的服务内有限重试/回退，每次真实尝试计数；继续其他查询及已读页面，不因一次搜索失败暂停整轮。网页版执行细则由 jobfinder_web/search_execution.py 和保存的 provider_policy 控制；宿主 agent 手动工具执行也须逐次记账，不冒充自动熔断。
 4. 路线A（平台渠道）按计划里带 `channel=<渠道>` 的任务逐条执行：`route=browse_list` 的任务**直接读列表页**，一条任务一页，`query` 就是该页 URL，一次入库 20–40 条；没有实测类目的渠道/岗位词会落成 `route=channel_search` 任务，走站内搜索。列表页直读按页计（一条 `browse_list` 任务 = 一页 = 1 次），站内搜索按次计；官网招聘页用浏览器读取同样按页计（读一页 = 1 次），三者在同一本预算账里。站内搜索受阻或不够用时，改读该站的**职能分类页**（`jobs.51job.com/<城市>/<类目>/p<n>/` 逐页）或**城市聚合页**（`liepin.com/city-xx/career/<类目>/`）——一次 20–40 条、带职责原文与岗位直链，入口与限制见[渠道方法与边界](references/verified-channels.md)；候选的 `task_ids` 必须指向该渠道自己的任务，不能借挂官网任务，否则预算与覆盖无法对账。路线B（官网渠道）按"查询词/研究检索 → 企业名单 → 逐家官网"推进：先执行本渠道 planned 的 `direct`（岗位查询词）与 `research`（研究型检索，交给 `domain_search`，一次跨十几来源给出"哪些企业在招"）任务并保存回执，再运行 `official-catalog --plan <计划> --receipt <回执> --output <名单>`，按候选首次出现顺序提取企业，剔除目录页、无企业名、代称（某/猎头/代招等）、无本渠道任务归属、以及**平台渠道任务**产出的候选（逐条写入 excluded 留痕）；`research` 任务里落在平台页的候选允许进名单，但写 `lead_only=true`，只当线索、须回官网核实企业全称与在招状态后才算证据；再运行 `official-plan --config <配置> --plan <计划> --catalog <名单> --output <新版计划>`，逐家生成"企业名 城市 岗位词 招聘"任务，超出每城预算的企业标 `budget_exhausted`，不删行。**逐家核实时优先用浏览器打开企业官网招聘页**（国内官网几乎都是前端渲染，静态抓取只能拿到空壳）：先试 URL 参数直接构造检索与翻页（如 `?name=<岗位词>`、`&page=2`、`#/position?jobName=<岗位词>`），失败再模拟输入；能读到岗位名/城市/类别/发布日期即可作为"该企业在招"的证据，**官网普遍不显示薪资**，这类条目薪资留空、由核心评估给出 `UNKNOWN` 进入 REVIEW，不得因薪资未披露判为不达标，也不得用平台渠道的薪资替官网岗位补值。官网确无公开岗位库（子域名不存在、`/careers/` 404、只返回业务介绍）的企业标注该结论后转平台渠道取岗位，入口形态与已知坑见[渠道方法与边界](references/verified-channels.md)。**两条线相互独立**：平台渠道发现的企业不进入官网名单，官网名单也不回填平台渠道；各花各的预算、各报各的覆盖。名单保留范围、获取时间、版本和限制；按入口契约复用已有链接或合并查找企业岗位。用户显式提供名单时仍可用 `extend-plan --catalog` 添加企业查询。未出现企业不推断属性为否，外地总部企业不排除。用户提供或正常岗位查询中遇到公告链接时，仍可按下方“公告反查与资源库”读取并反查雇主；高校、人社渠道继续可用。扩展为已知企业追加入口读取或合并查询，不恢复独立公告模板。
 5. 保存候选JSON（参照 references/host-compatibility.md 的回执契约，不使用旧数据冒充新搜索）：mode=agent_assisted、plan_id、config_fingerprint、search_mode、coverage、search_log、candidates。查询日志逐项保留 task_id,target_city,role_keyword,query,executed_at,search_tool,status,candidate_count；未执行/受限照实记录。候选含 query,url,title,discovered_at,source_channel,source_type,source_evidence,task_ids,target_cities,candidate_type,discovery_source；类型区分 company_home/career_entry/announcement/job_detail/enterprise_directory。保留原始发现URL、官网导航关系及后续状态。candidate_count指保留候选数量，不是引擎总命中数；对比历史URL说明新增与重新发现。每批已识别企业名称的候选都保存，不能因岗位不合适或页面未读通而丢弃企业。保存后立即执行 `record-discovery --config <同一配置> --plan <本次计划> --input <当前回执>`，在读取岗位前完成持久入库。CLI覆盖条件须保存到同一配置后再执行。
 6. 已有招聘入口/详情页按逐URL策略直接读取，不强制走首页或额外认证官方身份；需要站内发现时只沿实际原文链接。保留访问策略、条款、robots及预算。navigation_resources 最多2个且必须是官网引用的同域静态脚本，只提取字面链接，不执行脚本；navigation_urls 最多2个中间页。所有跳转逐目标检查，跨域须有明确 approved_redirects 配对证据。不得为访问成功而删除安全检查。
    仅有企业首页或需要回退时，核心发现明确招聘导航；未审核的新链接留在候选清单。linked_job_paths只能针对已审核站点的窄岗位路径开启，且必须在原页观察到链接，不能设为根路径。URL片段保留在发现记录，HTTP读取按无片段地址处理；临时匿名Cookie不等于账号登录，不读取或保存用户浏览器会话。
-7. `python -m jobfinder new-search --config <配置> --plan <本次计划> --candidates <本次候选> --policies <已审核策略> --output outputs/real/<唯一目录>`。核心验证配置指纹和查询关联，自动消费planned entry_tasks，按城市保留预算，读取原始页面、提取具体岗位、去重、重新匹配、导出。仅先读入口时可交付本计划关联的空回执，不伪造搜索。若输出follow-up-plan.json，执行其中planned合并查询后用该后续计划及新回执继续；预算消耗随计划延续，不重建计划重置预算。
+7. `python -m jobfinder new-search --config <配置> --plan <本次计划> --candidates <本次候选> --policies <已审核策略> --run <run_id> --output outputs/real/<唯一目录>`。核心验证配置指纹和查询关联，把回执并入同一运行，自动消费planned entry_tasks，按城市保留预算，读取原始页面、提取具体岗位、去重、重新匹配、导出。仅先读入口时可交付本计划关联的空回执，不伪造搜索。**命令返回里的 `verdict` 才是整轮结论**：`PARTIAL`/`WAITING_USER` 时必须报告未完成渠道和下一动作，不能因为生成了 Excel 就宣称已完成。若输出follow-up-plan.json，用同一运行继续；预算消耗随计划延续，不重建计划重置预算。
 8. 检查 results.json、city_statistics、reports、traversal-progress.json、query-log.jsonl、network.jsonl 和 Excel。列表覆盖及详情补读分别报告；未完成不得称全量已查完。每个城市必须报告，即使零结果/未检查。报告全局去重岗位数、逐城数量及统计口径；页面可读、岗位可解析、仍开放、满足条件是不同结论。启用的筛选维度及有效性未知进REVIEW；薪酬不限时不因未披露薪资单独判REVIEW。地域FAIL只进排除日志，不补造事实。
    动态外壳不等于零岗位。Moka原页init-data可提取带ID的逐岗位记录，但详情未完整读取时details_complete=false、不得MATCH；全量数与本次记录数分开。公开详情只读POST须有原站契约及逐URL批准，固定租户和参数，不能调用投递接口或复制脚本令牌。地点代码须引用脚本与行政区划证据核实，不凭数字猜测。
 

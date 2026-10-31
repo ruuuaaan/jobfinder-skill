@@ -1,5 +1,26 @@
 # 更新记录
 
+## 0.5.0
+
+运行控制器（协议 `workflow-1`）：把"渠道顺序 + 登录前置 + 完成判定"从提示词搬进程序。
+
+- 新增 `jobfinder/workflow.py`：`start-run / next-action / record-action / close-stage / finalize` 五个命令，运行状态落盘到 `data/runs/<run_id>/`。全局阶段顺序固定为 `official → recruitment → bendibao_web → public_accounts`，同一阶段内可按预算轮转城市/平台/任务，**跨阶段抢跑直接被拒**并返回当前允许的动作。用户明确只选部分渠道时按所选裁剪，不补回未选渠道。
+- 新增 `jobfinder/platform_auth.py`：招聘平台必须先完成**当前会话登录核验**才能搜索。核验由核心读取页面快照、自己算哈希、自己匹配平台账号专属 UI 标记，并检查登录表单/验证码遮罩与 `browser_context_id`/`tab_id` 是否与开页记录一致；有效期 120 分钟。**"薪资显示数字"不再作为登录证据**（属于内容完整性）。授权范围仅限 `browser_visible_dom`，不能顺带宣称无状态 HTTP 已登录。`public_only` 是用户显式选择的匿名模式，助手不得自行切换。
+- 任务状态区分 `pending / executed / failed / blocked / skipped_by_user / budget_exhausted`：单次失败只影响当前任务，最多 2 次尝试后转 `blocked`；`not_run` 或缺失记录不能作为关闭阶段依据；`skipped_by_user` 必须带用户确认，`blocked` 必须带能力检测或访问失败证据。
+- 统一 finalizer：`new-search`、`process-browser`、`resume-traversal`、后续计划都写入/复用同一完成判定，输出 `COMPLETE / PARTIAL / WAITING_USER / IN_PROGRESS`。阶段性导出允许，但 Excel 的"运行状态与完成度"表与命令行 `verdict` 必须标注未完成渠道和下一动作；`finalize` 在未完成时返回退出码 4。
+- 修复 0.4.0 的已知缺陷：
+  - `build_plan` 无条件生成官网任务 → 现在只在启用 `official_career` 时生成官网 `direct/research/enterprise` 任务。
+  - `browse_rows()` 对未适配城市返回空，但回退判断只看"岗位词是否命中类目"，导致该渠道彻底缺失 → 新增 `browse_covered_pairs()`，只有**实际生成了列表页任务**的「城市＋渠道＋岗位词」才取消站内搜索回退（北京等未适配城市现在会正常回退）。
+  - `validate_receipt()` 合并时用 `task | receipt`，回执可以把 `channel`/`route`/`stage` 覆盖掉计划值 → 现在计划字段不可覆盖（直接报错），合并以计划为准、只叠加允许的结果字段。
+  - 完成度检查中 `reports` 被 `if r.get("url")` 过滤，`url=None` 的渠道级记录不参与判定 → 现在渠道级报告参与判定；启用但完全没有任务记录的渠道以 `not_covered` 出现并把 `COMPLETE` 降级为 `PARTIAL`。
+  - 空回执/空任务集因 `any([])` 语义被算成完成 → 现在零执行、零任务一律不判 `COMPLETE`。
+  - `process-browser` 独立导出并自写 `status=complete` → 现在走统一 finalizer，浏览器采集不再能代表整轮完成。
+  - CLI 只打印 `discovery.status` → 现在同时输出 `verdict`、`run_id` 与未完成任务，启动时打印 Skill 版本 / 协议版本 / 加载路径。
+- 回执与预算：重复回执幂等（同哈希不重复扣费、不改证据时间）；阶段切换不清零额度；`skip/blocked/not_run` 不扣次数。
+- 兼容：无 `stage` 字段的旧计划按 `channel` 推导阶段；旧结果仍可 `export`（十列格式不变，无完成度区块）；旧任务接续时用 `start-run` 建立新运行上下文，历史证据时间与已消耗预算保留。
+- 文档：新增 `references/workflow.md`；重写 SKILL.md 的渠道顺序与登录章节为唯一主路径；统一 `setup.md`、`host-compatibility.md`、`budget.md` 中相互冲突的登录与顺序规则；明确标注"程序约束只覆盖经过控制器的动作"的边界。
+- 测试：新增 `tests/`（39 个用例，纯合成数据与受控 DOM），覆盖阶段顺序、登录前置、跨平台/跨会话会话复用、受阻继续、四渠道完整性、回执不得覆盖计划、空回执、重试与预算、幂等恢复、旧计划兼容；`scripts/demo_workflow_trace.py` 提供"四阶段正常执行"和"某平台登录受阻后继续"两条受控轨迹。
+
 ## 0.4.0
 
 - 计划改为**渠道 × 岗位词**生成任务：每个已选渠道都有自己的 `task_id` 与渠道额度，超出额度的任务标 `budget_exhausted` 保留不删；平台渠道不再借挂官网任务。

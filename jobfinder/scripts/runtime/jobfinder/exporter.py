@@ -147,7 +147,25 @@ def export_bundle(output: Path, config, jobs, results, reports, companies, disco
     conditions.extend([["检索条件："+k,json.dumps(v,ensure_ascii=False)] for k,v in config.model_dump(mode="json").items()])
     conditions.extend([["实际查询", json.dumps(q,ensure_ascii=False)] for q in discovery.get("search_log", [])])
     conditions.extend([["历史查询（本次未执行）",json.dumps(q,ensure_ascii=False)] for q in discovery.get("historical_search_log",[])])
+    completion = discovery.get("completion") or {}
+    if completion:
+        conditions.append(["运行标识", f"{completion.get('run_id')} / 协议 {completion.get('protocol_version')}"])
+        conditions.append(["完成度判定", f"{completion.get('verdict')}：{'；'.join(completion.get('reasons') or [])}"])
+        conditions.append(["阶段顺序", " → ".join(completion.get("stage_order") or [])])
+        if completion.get("next_action"):
+            conditions.append(["下一动作", json.dumps(completion["next_action"], ensure_ascii=False)])
+        if completion.get("partial_export"):
+            conditions.append(["导出性质", "阶段性导出：未完成渠道见「运行状态与完成度」，不能当作整轮检索完成"])
+        conditions.append(["边界", completion.get("boundary", "")])
     sheet(book,"检索条件与说明",["项目","说明"],conditions)
+    if completion:
+        rows=[[s.get("label"),s.get("stage"),s.get("status"),s.get("total"),s.get("executed"),
+               s.get("blocked"),s.get("skipped_by_user"),s.get("budget_exhausted"),s.get("pending"),
+               s.get("closed_at")] for s in completion.get("stages",[])]
+        rows+=[[r.get("channel"),r.get("stage"),r.get("status") or "recorded",r.get("total"),r.get("executed"),
+                r.get("blocked"),r.get("skipped_by_user"),r.get("budget_exhausted"),r.get("pending"),
+                (r.get("reason") or "")] for r in completion.get("channels",[])]
+        sheet(book,"运行状态与完成度",["名称","阶段","状态","计划任务","实际执行","受阻","用户跳过","预算耗尽","待处置","关闭时间/原因"],rows)
     city_rows=city_statistics(config,jobs,results,reports,discovery)
     if discovery.get("operation"):
         keys=["city","queries_planned","queries_executed","companies_discovered","companies_checked","candidate_links","pages_read","pages_parsed","jobs_extracted","jobs_reused","MATCH","REVIEW","EXCLUDED","restricted","failed","budget_exhausted","unchecked","queries_unchecked","note"]

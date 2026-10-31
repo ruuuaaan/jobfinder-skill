@@ -107,7 +107,7 @@ def apply_role_reviews(jobs, reviews, config, snapshots):
         job.role_review={k:review[k] for k in ('role_keywords','decision','quote','content_hash','rationale')}
 
 
-def process_browser_run(config, input_path, output, resource_path=None, mode='real', role_reviews_path=None):
+def process_browser_run(config, input_path, output, resource_path=None, mode='real', role_reviews_path=None, run_id=None, workspace=None):
     input_path,output=Path(input_path),Path(output)
     receipt=json.loads(input_path.read_text(encoding='utf-8-sig'))
     if receipt.get('schema_version')!='browser-run-1' or receipt.get('runtime')!='codex_browser_visible_dom':
@@ -157,6 +157,12 @@ def process_browser_run(config, input_path, output, resource_path=None, mode='re
                'browser_action_count':len(receipt['events']),'browser_snapshot_count':len(snapshots),'core_http_requests':0,
                'browser_actions_scope':'自动采集脚本阶段，含重试；不含前期页面结构观察',
                'browser_receipt':str(input_path.resolve()),'parse_errors':errors,'role_reviews':reviews}
+    # 浏览器采集只是官网阶段的一种读取方式：单企业采集完成 ≠ 官网阶段完成 ≠ 整轮完成。
+    completion = browser_completion(config, reports, receipt, run_id=run_id, workspace=workspace)
+    discovery['completion']=completion
+    discovery['run_id']=completion['run_id']
+    if completion['verdict']!='COMPLETE':
+        discovery['status']='partial'
     payload=export_bundle(output,config,jobs,results,reports,companies,discovery,events=[],mode=mode,annotate_reviews=True)
     (output/'browser-run.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2),encoding='utf-8')
     write_browser_audit(output,config,input_path,receipt,payload,role_reviews_path)
@@ -184,6 +190,36 @@ def process_browser_run(config, input_path, output, resource_path=None, mode='re
         store.snapshot()
     write_report(output,payload,receipt)
     return payload
+
+
+def browser_completion(config, reports, receipt, run_id=None, workspace=None):
+    """浏览器采集的完成度必须走统一 finalizer，不能自己写 status='complete'。"""
+    from . import workflow
+    plan_id = (receipt.get('plan') or {}).get('plan_id')
+    if run_id and workspace:
+        state = workflow.load_state(workspace, run_id)
+        for report in reports:
+            company = report.get('company')
+            for task in state['tasks']:
+                if task['stage'] != 'official' or task.get('company') != company:
+                    continue
+                if task['status'] in workflow.TASK_TERMINAL:
+                    continue
+                ok = report.get('access_status') == 'success' and report.get('coverage_complete')
+                task['status'] = 'executed' if ok else 'blocked'
+                task['reason'] = report.get('reason')
+                task['attempts'] = max(task.get('attempts') or 0, 1)
+                task['executed_at'] = task.get('executed_at') or now()
+        completion = workflow.finalize(state, workspace=workspace)
+        return workflow.completion_with_channels(completion, config, reports)
+    state = workflow.state_from_plan_logs({'plan_id': plan_id, 'channels': list(config.sources)}, [], config, reports)
+    completion = workflow.finalize(state)
+    completion = workflow.completion_with_channels(completion, config, reports)
+    if any(not r.get('coverage_complete') for r in reports) and completion['verdict'] == 'COMPLETE':
+        completion['verdict'] = 'PARTIAL'
+        completion['partial_export'] = True
+        completion['reasons'].append('存在覆盖不完整的企业，浏览器采集不能代表整轮完成')
+    return completion
 
 
 def write_browser_audit(output,config,input_path,receipt,payload,role_reviews_path=None):

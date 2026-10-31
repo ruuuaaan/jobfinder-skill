@@ -1,6 +1,6 @@
 # 数据与导出契约
 
-软件版本 0.3.0-beta.1；有效条件 schema_version 为 job-search-spec-1；新任务业务规则为 CN_MAINLAND-4.0。结果包字段及旧规则兼容以 jobfinder/spec.py、models.py、exporter.py 为准。
+软件版本 0.5.0；执行协议 workflow-1；有效条件 schema_version 为 job-search-spec-1；新任务业务规则为 CN_MAINLAND-4.0。结果包字段及旧规则兼容以 jobfinder/spec.py、models.py、exporter.py、workflow.py 为准。
 
 ## 条件与证据
 
@@ -35,6 +35,24 @@ MATCH / REVIEW / EXCLUDED 只能由匹配核心产生；checked_at 是计算时�
 
 导入按文件内容去重，不联网、不重新匹配；原结果与时间保持不变。最多 10 MiB / 5000 条；较大任务可分别导出。合并结果保留来源，不能将旧证据当成本次核验。
 
+## 运行状态与完成度
+
+每次新检索在 `<workspace>/data/runs/<run_id>/` 下保存 `state.json`（协议版本、计划指纹、城市/岗位/渠道/阶段顺序、当前阶段、任务状态、预算、登录核验记录、范围调整）、`events.jsonl`、`completion.json` 与 `auth/` 快照。
+
+`completion` 结构（同时写入 results.json 的 `discovery.completion`）：
+
+| 字段 | 含义 |
+|---|---|
+| `verdict` | `COMPLETE` / `PARTIAL` / `WAITING_USER` / `IN_PROGRESS` |
+| `reasons` | 判定理由，逐条可读 |
+| `stages` | 逐阶段：状态、任务总数、实际执行、受阻、跳过、预算耗尽、待处置、关闭时间 |
+| `channels` | 逐渠道：同上，另含 `auth_status`、`auth_checked_at`、`status`（`recorded`/`not_covered`）、原因 |
+| `unfinished` | 未处置任务清单（task_id、渠道、阶段、状态、原因） |
+| `next_action` | 未完成时的下一动作 |
+| `partial_export` | 是否属于阶段性导出 |
+
+results.xlsx 在存在 `completion` 时新增"运行状态与完成度"工作表；岗位汇总.xlsx 的十列结构与列序不变。旧结果（无 `completion`）导出时不生成该表。
+
 ## 存储边界
 
-真实任务使用 outputs/real，合成验收使用 outputs/test。本机后台数据默认 data/webapp，可用 JOBFINDER_WEB_DATA 指定独立目录。配置、凭据、浏览器状态和实际收集数据不进入发布包。
+真实任务使用 outputs/real，合成验收使用 outputs/test。运行状态、登录快照与回执属于本机数据，不进入发布包。本机后台数据默认 data/webapp，可用 JOBFINDER_WEB_DATA 指定独立目录。配置、凭据、浏览器状态和实际收集数据不进入发布包。

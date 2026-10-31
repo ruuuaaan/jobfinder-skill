@@ -14,4 +14,10 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r jobfinder/requirements.txt
-      - run: python scripts/smoke_release.py
+      - name: Portable package and offline pipeline
+        run: python scripts/smoke_release.py
+      - name: Controller and core tests
+        run: python -m unittest discover -s tests -t tests -v
+      - name: Controlled two-trace workflow run
+        shell: bash
+        run: python scripts/demo_workflow_trace.py "$RUNNER_TEMP/jf-trace"

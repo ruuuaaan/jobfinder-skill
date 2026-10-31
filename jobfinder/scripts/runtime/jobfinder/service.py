@@ -70,7 +70,7 @@ def import_jobs(candidate):
     raise ParseError("附件类型尚未实现可靠岗位拆分；PDF文本/扫描件/图片须人工处理，不能记为解析成功")
 
 
-def run(config, output, candidates_file=None, policies_file=None, mode="real", catalog_file=None, operation="provided_links", plan_file=None, effective=None, resource_path=None, resume_file=None, resume_budget='remaining'):
+def run(config, output, candidates_file=None, policies_file=None, mode="real", catalog_file=None, operation="provided_links", plan_file=None, effective=None, resource_path=None, resume_file=None, resume_budget='remaining', run_id=None):
     output=output_path(output,mode)
     provider=CodexCandidateProvider(local_path(candidates_file)) if candidates_file else UnconfiguredSearchProvider()
     candidates, discovery=provider.discover(config)
@@ -91,6 +91,7 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
               'query_history':checkpoint.get('query_history',[]) if resume_budget=='remaining' else []}
         discovery.update(status='resume_traversal',resume_budget_mode=resume_budget,prior_progress=str(resume_file),
                          coverage='只继续未完成遍历；已读原文证据沿用原时间，不冒充本次重新读取')
+    run_state = None
     if operation == "new_search":
         if not candidates_file or not plan_file:
             raise ValueError("new-search需要本次计划与实际搜索凭据；Python不能调用宿主 agent 的会话搜索")
@@ -98,6 +99,14 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
         plan=json.loads(local_path(plan_file).read_text(encoding="utf-8-sig"))
         discovery["search_log"]=validate_receipt(config,plan,receipt)
         ensure_new_execution(plan,discovery['search_log'],ROOT/'outputs'/'real')
+        if run_id:
+            from . import workflow
+            run_state=workflow.load_state(ROOT,run_id)
+            if run_state.get('plan_id') not in (None,plan['plan_id']):
+                raise ValueError('运行状态与本次计划不一致，不能把两次运行合并')
+            workflow.merge_receipt(run_state,receipt,config,plan)
+            workflow.save_state(run_state,ROOT)
+            discovery['run_id']=run_id
         discovery['entry_tasks'] = plan.get('entry_tasks',[])
         for task in plan.get('entry_tasks',[]):
             if task['status'] == 'planned':
@@ -398,7 +407,35 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
         discovery['entry_log'].append(dict(task_id=task['task_id'],company=task['company'],target_city=task['target_city'],
             status=checked.get('entry_outcome',checked.get('access_status',task['status'])),
             reason=checked.get('fallback_search_reason') or checked.get('reason') or task['reason']))
-    discovery["execution_status"]="partial" if any(r.get("coverage_incomplete") or r.get("access_status") not in ("success","manual_import","cached_progress") or r.get("parse_status") not in ('success','listing','navigation') or any(x.get('status') in ('policy_pending','budget_exhausted') for x in r.get('discovered_links',[])) for r in reports if r.get("url")) or any(q.get("status")!="success" for q in discovery.get("search_log",[])) or any(t['status']!='relevant_job_found' for t in discovery['entry_log']) else "completed_within_declared_scope"
+    # 整轮完成判定统一交给 workflow：所有入口共用同一 finalizer，不再各自解释"成功"。
+    # 旧字段 execution_status 继续保留，但只作为 completion 的投影。
+    # 注意：渠道级报告（url=None）也必须参与缺口判定，不能因为拿不到详情页就隐身。
+    evidence_gap = any(r.get("coverage_incomplete")
+                       or r.get("access_status") not in ("success", "manual_import", "cached_progress")
+                       or r.get("parse_status") not in ('success', 'listing', 'navigation')
+                       or any(x.get('status') in ('policy_pending', 'budget_exhausted') for x in r.get('discovered_links', []))
+                       for r in reports) \
+        or any(q.get("status") != "success" for q in discovery.get("search_log", [])) \
+        or any(t['status'] != 'relevant_job_found' for t in discovery['entry_log'])
+    from . import workflow
+    if run_state is not None:
+        completion = workflow.finalize(run_state, persist=True, workspace=ROOT)
+    else:
+        completion = workflow.finalize(workflow.state_from_plan_logs(plan, discovery.get('search_log', []), config, reports))
+    completion = workflow.completion_with_channels(completion, config, reports)
+    if evidence_gap and completion["verdict"] == "COMPLETE":
+        completion["verdict"] = "PARTIAL"
+        completion["partial_export"] = True
+        completion["reasons"].append("存在页面读取或解析缺口（含未读取的渠道级记录）")
+    discovery["completion"] = completion
+    discovery["run_id"] = completion["run_id"]
+    discovery["execution_status"] = ("completed_within_declared_scope"
+                                     if completion["verdict"] == "COMPLETE" else "partial")
+    if operation == "new_search":
+        discovery["status"] = {"COMPLETE": "completed_within_declared_scope",
+                               "WAITING_USER": "incomplete_pending",
+                               "IN_PROGRESS": "incomplete_pending",
+                               "FAILED": "search_failed"}.get(completion["verdict"], "search_partial")
     for record in discovery["candidates"]:
         report=next((r for r in reports if r.get("url")==record["url"]),None)
         record["processing_status"]=f"{report['access_status']}/{report['parse_status']}" if report else "not_run"

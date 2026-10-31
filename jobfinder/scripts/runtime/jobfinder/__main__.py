@@ -5,13 +5,22 @@ from pathlib import Path
 from .service import ROOT, load_config, run, reexport, local_path
 from .catalog import import_catalog, save_new_json, import_official_directory
 from .models import SearchConfig
-from .planning import build_plan, effective_config, authorize_config, extend_plan
+from .planning import build_plan, effective_config, authorize_config, extend_plan, fingerprint
+from . import __version__ as SKILL_VERSION
+from .workflow import PROTOCOL_VERSION
+
+
+def _banner():
+    """启动横幅：实际版本、执行协议版本与加载路径，便于排查旧副本。"""
+    return (f"[jobfinder] skill {SKILL_VERSION} | protocol {PROTOCOL_VERSION} | "
+            f"{Path(__file__).resolve().parents[2]}")
 
 
 def main():
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+    print(_banner(), file=sys.stderr)
     parser=argparse.ArgumentParser(prog="python -m jobfinder",description="中国大陆岗位检索：Agent辅助发现 + 独立可测试核心")
     commands=parser.add_subparsers(dest="command",required=True)
     for name in ("validate-config","offline","process-candidates","process-browser","search","export","plan","extend-plan","new-search","refresh","resume-traversal"):
@@ -42,6 +51,24 @@ def main():
             p.add_argument('--knowledge-base',help='只读企业SQLite库或完整JSON快照')
             p.add_argument('--catalog-source',choices=['enterprise_directory','listed_companies','knowledge_base'])
             p.add_argument('--company',action='append',help='用户明确指定的企业，保留查询入口；可重复')
+        if name in ('new-search','process-browser'):
+            p.add_argument('--run',help='绑定到 start-run 创建的本轮运行；缺省时按计划临时重建只读快照')
+    p=commands.add_parser("start-run",help="创建本轮运行并冻结渠道与阶段顺序")
+    p.add_argument("--config",required=True)
+    p.add_argument("--plan",required=True)
+    p.add_argument("--channel",action="append",help="用户明确只选的渠道，可重复；不传则取配置渠道")
+    p.add_argument("--public-only",action="store_true",help="显式匿名读取模式（platform_auth_policy=public_only）")
+    p.add_argument("--run-id")
+    p.add_argument("--output")
+    p=commands.add_parser("next-action",help="返回当前唯一合法的下一动作")
+    p.add_argument("--run"); p.add_argument("--output")
+    p=commands.add_parser("record-action",help="提交实际执行回执（计划字段不可覆盖）")
+    p.add_argument("--input",required=True); p.add_argument("--run"); p.add_argument("--output")
+    p=commands.add_parser("close-stage",help="检查并关闭当前阶段")
+    p.add_argument("--stage"); p.add_argument("--run"); p.add_argument("--output")
+    p=commands.add_parser("finalize",help="统一检查整轮状态并给出完成度")
+    p.add_argument("--run"); p.add_argument("--close",action="store_true",help="可关闭的阶段自动推进后再判定")
+    p.add_argument("--output")
     p=commands.add_parser("official-catalog",help="官网渠道：从岗位查询词搜索结果提取企业，形成独立名单")
     p.add_argument("--plan",required=True,help="本渠道已执行的查询计划")
     p.add_argument("--receipt",required=True,help="本渠道查询回执（含 candidates.task_ids）")
@@ -102,6 +129,60 @@ def main():
                               'order':[c['legal_name'] for c in catalog['companies']],
                               'output':str(local_path(args.output))},ensure_ascii=False))
             return 0
+        if args.command in ('start-run','next-action','record-action','close-stage','finalize'):
+            from . import workflow
+            if args.command=='start-run':
+                from .spec import matching_config
+                raw=json.loads(local_path(args.config).read_text(encoding='utf-8-sig'))
+                config=matching_config(raw)
+                plan=json.loads(local_path(args.plan).read_text(encoding='utf-8-sig'))
+                if plan.get('config_fingerprint')!=fingerprint(config):
+                    raise ValueError('计划与配置指纹不一致：请先用当前配置重新 plan')
+                state=workflow.start_run(config,plan,ROOT,channels=args.channel,
+                                         public_only=args.public_only,run_id=args.run_id)
+                result={'run_id':state['run_id'],'protocol_version':PROTOCOL_VERSION,
+                        'stage_order':state['scope']['stage_order'],'channels':state['scope']['channels'],
+                        'platform_auth_policy':state['scope']['platform_auth_policy'],
+                        'tasks':len(state['tasks']),'state':str(workflow.state_file(ROOT,state['run_id'])),
+                        'next':workflow.next_action(state)}
+                print(json.dumps(result,ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0
+            state=workflow.resolve_state(ROOT,args.run)
+            if args.command=='next-action':
+                action=workflow.next_action(state)
+                workflow.save_state(state,ROOT)
+                print(json.dumps({'run_id':state['run_id'],'action':action},ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),action)
+                return 0
+            if args.command=='record-action':
+                payload=json.loads(local_path(args.input).read_text(encoding='utf-8-sig'))
+                result=workflow.record_action(state,payload,ROOT)
+                print(json.dumps({'run_id':state['run_id'],'result':result},ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0
+            if args.command=='close-stage':
+                stage=args.stage or state['current_stage']
+                closed=workflow.close_stage(state,stage,workspace=ROOT)
+                nxt=workflow.next_action(state)
+                workflow.save_state(state,ROOT)
+                print(json.dumps({'run_id':state['run_id'],'closed':closed,'current_stage':state['current_stage'],
+                                  'next':nxt},ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),closed)
+                return 0
+            if args.command=='finalize':
+                if args.close:
+                    completion=workflow.finish_run(state,ROOT)
+                else:
+                    completion=workflow.finalize(state,workspace=ROOT)
+                print(json.dumps(completion,ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),completion)
+                return 0 if completion['verdict'] in ('COMPLETE','PARTIAL') else 4
         raw=json.loads(local_path(args.config).read_text(encoding="utf-8-sig"))
         overrides={}
         if args.city is not None:
@@ -172,16 +253,17 @@ def main():
             return 0
         if args.command=='process-browser':
             from .browser import process_browser_run
-            result=process_browser_run(config,local_path(args.input),local_path(args.output),ROOT/'data/resources/companies.sqlite3',role_reviews_path=local_path(args.role_reviews) if args.role_reviews else None)
+            result=process_browser_run(config,local_path(args.input),local_path(args.output),ROOT/'data/resources/companies.sqlite3',role_reviews_path=local_path(args.role_reviews) if args.role_reviews else None,run_id=args.run,workspace=ROOT)
         elif args.command=="export":
             result=reexport(config,args.input,args.output,effective)
         elif args.command=='resume-traversal':
             result=run(config,args.output,policies_file=args.policies,operation='resume_traversal',effective=effective,
-                       resource_path=ROOT/'data/resources/companies.sqlite3',resume_file=args.input,resume_budget=args.budget_mode)
+                       resource_path=ROOT/'data/resources/companies.sqlite3',resume_file=args.input,resume_budget=args.budget_mode,run_id=getattr(args,'run',None))
         else:
             operation={"new-search":"new_search","refresh":"refresh"}.get(args.command,"provided_links")
-            result=run(config,args.output,getattr(args,"candidates",None),getattr(args,"policies",None),"test" if args.command=="offline" else "real",getattr(args,"catalog",None),operation,getattr(args,"plan",None),effective,resource_path=ROOT/"data/resources/companies.sqlite3" if args.command!="offline" else None)
-        print(json.dumps({"mode":result["mode"],"jobs_extracted":0 if args.command=='export' else len(result['jobs']),"jobs_in_evidence":len(result["jobs"]),"counts":result["counts"],"discovery":result["discovery"]["status"],"output":str(local_path(args.output))},ensure_ascii=False))
+            result=run(config,args.output,getattr(args,"candidates",None),getattr(args,"policies",None),"test" if args.command=="offline" else "real",getattr(args,"catalog",None),operation,getattr(args,"plan",None),effective,resource_path=ROOT/"data/resources/companies.sqlite3" if args.command!="offline" else None,run_id=getattr(args,'run',None))
+        completion=result["discovery"].get("completion") or {}
+        print(json.dumps({"mode":result["mode"],"jobs_extracted":0 if args.command=='export' else len(result['jobs']),"jobs_in_evidence":len(result["jobs"]),"counts":result["counts"],"discovery":result["discovery"]["status"],"verdict":completion.get("verdict"),"run_id":completion.get("run_id"),"unfinished":[u["task_id"] for u in completion.get("unfinished",[])][:20],"output":str(local_path(args.output))},ensure_ascii=False))
         return 3 if args.command=="search" and result["discovery"]["status"]=="unconfigured" else 0
     except (ValueError, OSError, KeyError) as exc:
         print("JobFinder错误："+str(exc),file=sys.stderr)

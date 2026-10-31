@@ -9,6 +9,7 @@ from .input_rules import recruitment_terms
 from .company_selection import select_companies
 from .role_expansion import RoleExpansion
 from .entries import entry_task
+from .workflow import channel_stage, PROTOCOL_VERSION
 
 OFFICIAL = 'official_career'
 MANUAL = 'manual_import'
@@ -71,6 +72,9 @@ def browse_rows(city, roles, channels):
 
     同一渠道下多个岗位词命中同一类目时合并成一条（covers_roles 留痕），
     否则会生成两条完全相同的 URL 任务。
+
+    未适配的城市直接返回空列表——调用方必须据此回退到站内搜索，
+    不能因为"岗位词命中类目"就取消回退（那会让该渠道彻底缺失）。
     """
     meta = BROWSE_CITIES.get(city)
     if not meta:
@@ -98,6 +102,19 @@ def browse_rows(city, roles, channels):
                                  browse_url=base, browse_page=page, browse_label=row['label'],
                                  covers_roles=list(row['covers']), company=None, exhausted=False))
     return rows
+
+
+def browse_covered_pairs(city, roles, channels):
+    """返回 (渠道, 岗位词) 中**实际生成了列表页任务**的组合。
+
+    只有这里出现的组合才允许取消站内搜索回退；城市未适配、类目未命中、
+    渠道未收录时都不算覆盖。
+    """
+    covered = set()
+    for row in browse_rows(city, roles, channels):
+        for role in row.get('covers_roles') or [row['role']]:
+            covered.add((row['channel'], role))
+    return covered
 
 
 def search_channels(config):
@@ -138,48 +155,54 @@ def build_plan(config, catalog=None, *, role_groups=None, company_assessments=No
         role_groups = RoleExpansion.model_validate(role_groups).model_dump()
     selected_by_city, selection = select_companies(config,catalog,role_groups,company_assessments,knowledge,requested_companies)
     other_channels = search_channels(config)
+    official_enabled = OFFICIAL in config.sources
     for city in cities(config):
         selected = selected_by_city[city]
         local = []
+        role_pairs = [(role, hiring_type) for role in discovery_terms(config)
+                      for hiring_type in (recruitment_terms(config.recruitment_type) or [""])]
         # 1. 官网渠道的岗位查询词任务：每个岗位词一条，不含目录/名录类查询。
         #    官网不使用"监管企业名录"这类目录页：目录页不是岗位来源，也拿不到企业是否在招；
         #    企业名单一律从本渠道查询词结果里提取（official_channel.build_catalog）。
-        for role in discovery_terms(config):
-            for hiring_type in recruitment_terms(config.recruitment_type) or [""]:
+        #    未启用官网时不生成任何官网任务——用户只选平台渠道时不应凭空多出官网链路。
+        if official_enabled:
+            for role, hiring_type in role_pairs:
                 local.append(dict(route="direct", role=role, channel=OFFICIAL,
                                   query=f'{city} {role} {hiring_type} 招聘 官网 工作地点'.replace("  ", " "),
                                   company=None, exhausted=False))
-        role_pairs = [(role, hiring_type) for role in discovery_terms(config)
-                      for hiring_type in (recruitment_terms(config.recruitment_type) or [""])]
         # 2. 官网渠道的研究型检索任务：交给 domain_search，产出"正在招聘的企业"名单。
         #    与 direct 查询词任务并列，属于官网渠道自己的发现任务；平台渠道任务产出的
         #    企业仍然不进名单（见 official_channel._reject_reason）。
-        for role, hiring_type in role_pairs:
-            local.append(dict(route=RESEARCH, role=role, channel=OFFICIAL,
-                              query=f'{city} {role} {hiring_type} 正在招聘的企业 名单 官网招聘'.replace("  ", " "),
-                              company=None, exhausted=False))
+        if official_enabled:
+            for role, hiring_type in role_pairs:
+                local.append(dict(route=RESEARCH, role=role, channel=OFFICIAL,
+                                  query=f'{city} {role} {hiring_type} 正在招聘的企业 名单 官网招聘'.replace("  ", " "),
+                                  company=None, exhausted=False))
         # 3. 平台渠道：列表页直读是主路径，一页一条任务（便于按次对账）。
         local.extend(browse_rows(city, [role for role, _ in role_pairs], other_channels))
-        # 3b. 没有实测列表页的渠道/岗位词，退回站内搜索，不硬编 URL。
+        # 3b. 只有"城市＋渠道＋岗位词"**实际生成了列表页任务**时才取消站内搜索回退；
+        #     城市未适配、类目未命中都要退回站内搜索，否则该渠道会彻底缺失。
+        covered = browse_covered_pairs(city, [role for role, _ in role_pairs], other_channels)
         for role, hiring_type in role_pairs:
             for channel in other_channels:
-                if browse_category(channel, role):
+                if (channel, role) in covered:
                     continue
                 local.append(dict(route="channel_search", role=role, channel=channel,
                                   query=channel_query(channel, city, role, hiring_type),
                                   company=None, exhausted=False))
         # 4. 企业任务（企业库/名单指定）：仍归官网渠道，是产出不是线索来源。
         # Never filter employers by headquarters/registration; outside employers can hire here.
-        for company in selected:
-            name = company["legal_name"]
-            reuse = entry_task(company,entry_knowledge if entry_knowledge is not None else knowledge,config,city,f'{city}-entry-{len(entry_tasks)+1}')
-            if reuse:
-                entry_tasks.append(reuse)
-                continue
-            term = " ".join(config.role_keywords) if config.role_mode == "keywords" else ""
-            local.append(dict(route="enterprise", role=term, channel=OFFICIAL,
-                              query=f'{name} {city} {term} 招聘'.replace("  ", " "), company=name,
-                              exhausted=bool(company.get('company_budget_exhausted'))))
+        if official_enabled:
+            for company in selected:
+                name = company["legal_name"]
+                reuse = entry_task(company,entry_knowledge if entry_knowledge is not None else knowledge,config,city,f'{city}-entry-{len(entry_tasks)+1}')
+                if reuse:
+                    entry_tasks.append(reuse)
+                    continue
+                term = " ".join(config.role_keywords) if config.role_mode == "keywords" else ""
+                local.append(dict(route="enterprise", role=term, channel=OFFICIAL,
+                                  query=f'{name} {city} {term} 招聘'.replace("  ", " "), company=name,
+                                  exhausted=bool(company.get('company_budget_exhausted'))))
         # 预算：先按每渠道上限（官网优先分配时由 base_allocation 给出），再按每城总量。
         channel_caps = (spec.search_budget.per_city_channel or {}).get(city, {})
         city_cap = config.budget.city_searches(city)
@@ -203,6 +226,7 @@ def build_plan(config, catalog=None, *, role_groups=None, company_assessments=No
                 reason = 'configured_channel_search'
             tasks.append(dict(task_id=f'{city}-{index+1}', target_city=city, role_keyword=row["role"],
                               query=row["query"], route=row["route"], channel=row["channel"],
+                              stage=channel_stage(row["channel"]),
                               **{k: row[k] for k in ("browse_url", "browse_page", "browse_label", "covers_roles") if k in row},
                               company=row["company"], company_source=employer.get('source_url'),
                               company_selection=employer.get('selection_decision'),
@@ -211,11 +235,17 @@ def build_plan(config, catalog=None, *, role_groups=None, company_assessments=No
                               executed_at=None, search_tool=None, candidate_count=0))
     channel_plan = {}
     for task in tasks:
-        row = channel_plan.setdefault(task["channel"], {"routes": {}, "planned": 0, "budget_exhausted": 0})
+        row = channel_plan.setdefault(task["channel"], {"routes": {}, "planned": 0, "budget_exhausted": 0,
+                                                        "stage": task.get("stage")})
         row["routes"][task["route"]] = row["routes"].get(task["route"], 0) + 1
         if task["status"] in ("planned", "budget_exhausted"):
             row[task["status"]] += 1
+    stage_order = [s for s in ("official", "recruitment", "bendibao_web", "public_accounts")
+                   if any(t.get("stage") == s for t in tasks) or
+                   (s == "official" and config.sources and OFFICIAL in config.sources)]
     return dict(plan_id=str(uuid.uuid4()), created_at=now(), config_fingerprint=fingerprint(config),
+                protocol_version=PROTOCOL_VERSION,
+                channels=list(config.sources), stage_order=stage_order,
                 effective_config=config.model_dump(mode="json"), effective_search_spec=spec.model_dump(mode='json'), rule_version=config.rules_version,
                 synonym_expansions=[], tasks=tasks, entry_tasks=entry_tasks, catalog_scope=(catalog or {}).get("scope"),
                 role_groups=role_groups, company_assessments=company_assessments,
@@ -225,6 +255,11 @@ def build_plan(config, catalog=None, *, role_groups=None, company_assessments=No
                                      "pages": v["pages"], "page_url": v["page_url"]}
                                  for c, v in BROWSE_CATALOG.items()},
                 coverage="逐城市小预算候选发现，不代表城市或全国完整覆盖")
+
+
+PLAN_GUARD_FIELDS = ("task_id", "query", "target_city", "role_keyword", "channel", "route", "stage", "company")
+RECEIPT_RESULT_FIELDS = ("status", "executed_at", "search_tool", "candidate_count", "reason",
+                         "search_mode", "lead_only", "evidence_ref")
 
 
 def validate_receipt(config, plan, data):
@@ -238,8 +273,12 @@ def validate_receipt(config, plan, data):
         raise ValueError("查询任务记录重复")
     for item in logs:
         task = planned.get(item["task_id"])
-        if not task or any(item.get(k) != task[k] for k in ["query", "target_city", "role_keyword"]):
+        if not task or any(item.get(k) != task.get(k) for k in ["query", "target_city", "role_keyword"]):
             raise ValueError("实际查询与计划不一致")
+        # 回执只能提交结果字段；任务归属、渠道、路由、阶段等计划字段不可被改写。
+        for field in PLAN_GUARD_FIELDS:
+            if field in item and item[field] != task.get(field):
+                raise ValueError(f"回执不能覆盖计划字段 {field}：计划为 {task.get(field)!r}，回执为 {item[field]!r}")
         if item.get("status") not in ("success", "failed", "restricted", "not_run", "budget_exhausted"):
             raise ValueError("缺少明确查询执行状态")
         if item["status"] in ("success", "failed", "restricted"):
@@ -265,8 +304,21 @@ def validate_receipt(config, plan, data):
         count = sum(item["task_id"] in c.get("task_ids", []) for c in data.get("candidates", []))
         if item.get("candidate_count") != count:
             raise ValueError("查询候选数量与记录不一致")
-    return [(t | logged.get(t['task_id'], {'status': 'not_run' if t['status'] == 'planned' else t['status']}) | {'company': t.get('company'), 'company_source': t.get('company_source'), 'company_selection':t.get('company_selection'),
-             'outcome':'not_found_this_run' if logged.get(t['task_id'],{}).get('status')=='success' and not logged[t['task_id']].get('candidate_count') else 'see_execution_status'}) for t in plan['tasks']]
+    merged = []
+    for task in plan["tasks"]:
+        log = logged.get(task["task_id"], {})
+        # 以计划为准：先取计划字段，再只叠加回执允许的结果字段。
+        row = dict(task)
+        row.update({k: log[k] for k in RECEIPT_RESULT_FIELDS if k in log})
+        row["status"] = log.get("status", "not_run" if task["status"] == "planned" else task["status"])
+        row["company"] = task.get("company")
+        row["company_source"] = task.get("company_source")
+        row["company_selection"] = task.get("company_selection")
+        row["outcome"] = ("not_found_this_run"
+                          if log.get("status") == "success" and not log.get("candidate_count")
+                          else "see_execution_status")
+        merged.append(row)
+    return merged
 
 
 def effective_config(config, source, overrides=None):
@@ -320,7 +372,7 @@ def extend_plan(config, plan, catalog, *, role_groups=None, company_assessments=
             if query in plan.get('query_history',[]) or any(t['query']==query for t in local):
                 continue
             remaining = config.budget.city_searches(city)-plan.get('budget_used',{}).get('searches',{}).get(city,0)
-            plan['tasks'].append(dict(task_id=f'{city}-{len(local)+1}',target_city=city,role_keyword=term,query=query,route='announcement_reverse' if company.get('discovery_route')=='announcement_reverse' else 'enterprise',channel='official_career',company=company['legal_name'],company_source=company.get('source_url'),company_selection=company['selection_decision'],reason='no_reusable_entry',created_at=now(),status='planned' if len(local)<remaining and not company.get('company_budget_exhausted') else 'budget_exhausted',executed_at=None,search_tool=None,candidate_count=0))
+            plan['tasks'].append(dict(task_id=f'{city}-{len(local)+1}',target_city=city,role_keyword=term,query=query,route='announcement_reverse' if company.get('discovery_route')=='announcement_reverse' else 'enterprise',channel='official_career',stage='official',derived_from='extend_plan',company=company['legal_name'],company_source=company.get('source_url'),company_selection=company['selection_decision'],reason='no_reusable_entry',created_at=now(),status='planned' if len(local)<remaining and not company.get('company_budget_exhausted') else 'budget_exhausted',executed_at=None,search_tool=None,candidate_count=0))
     plan.setdefault('company_selection_history', []).append(selection)
     plan['requested_companies'] = requested_companies
     plan['company_assessments'] = company_assessments
@@ -348,10 +400,12 @@ def followup_plan(config, requests, logs, parent=None, budget_used=None):
         allowance = config.budget.city_requests(cities(config).index(city),len(cities(config)),used.get('requests',{}).get(city,0))
         readable = allowance is None or allowance > 0
         tasks.append(dict(task_id=f'{city}-fallback-{len(tasks)+1}',target_city=city,company=company,
-            role_keyword=role,query=query,route='enterprise_fallback',company_source=request.get('source_url'),
+            role_keyword=role,query=query,route='enterprise_fallback',channel='official_career',stage='official',
+            derived_from='followup_plan',company_source=request.get('source_url'),
             status='planned' if allocated < remaining and readable else 'budget_exhausted',
             reason=request['reason'] if readable else 'request_budget_exhausted',executed_at=None,search_tool=None,candidate_count=0))
     return dict(plan_id=str(uuid.uuid4()),parent_plan_id=parent.get('plan_id'),created_at=now(),
+        protocol_version=PROTOCOL_VERSION,channels=list(config.sources),
         rule_version=config.rules_version,config_fingerprint=fingerprint(config),effective_config=config.model_dump(mode='json'),
         tasks=tasks,entry_tasks=[],skipped=skipped,budget_used=used,query_history=list(dict.fromkeys(history)),
         status='awaiting_assistant_search' if any(t['status']=='planned' for t in tasks) else 'no_executable_search',
