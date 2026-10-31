@@ -10,10 +10,15 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def normalized_digest(path):
+    """LF 归一化后取哈希：Windows 与 Linux 检出同一份内容得到同一摘要。"""
+    return hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+
+
 def main():
     manifest = json.loads((ROOT / 'MANIFEST.sha256.json').read_text(encoding='utf-8'))
     for name, digest in manifest.items():
-        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, name
+        assert normalized_digest(ROOT / name) == digest, name
     skill = ROOT / 'jobfinder/SKILL.md'
     if skill.exists():
         with tempfile.TemporaryDirectory(prefix='jobfinder space ') as tmp:

@@ -9,6 +9,11 @@ SKIP_FILES = {'MANIFEST.sha256.json'}
 SKIP_SUFFIXES = {'.pyc', '.pyo', '.tmp'}
 
 
+def digest(path):
+    """按 LF 归一化后取哈希：同一份内容在 Windows/Linux 检出下必须得到同一摘要。"""
+    return hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+
+
 def release_files():
     files = []
     for path in sorted(ROOT.rglob('*')):
@@ -30,7 +35,7 @@ def main():
         check = json.loads(check_path.read_text(encoding='utf-8'))
         check['file_count'] = len(files) + 1  # 清单本身也属于发布包
         check_path.write_text(json.dumps(check, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    manifest = {rel: hashlib.sha256((ROOT / rel).read_bytes()).hexdigest() for rel in files}
+    manifest = {rel: digest(ROOT / rel) for rel in files}
     (ROOT / 'MANIFEST.sha256.json').write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     print(f'manifest updated: {len(manifest)} files')
