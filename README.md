@@ -1,6 +1,6 @@
 # JobFinder Skill
 
-跨 Agent 的中国大陆岗位检索技能，版本 0.5.1 / MIT。
+跨 Agent 的中国大陆岗位检索技能，版本 0.5.4 / MIT。
 完整复制本仓库的 jobfinder/ 到宿主认可的技能目录。支持读取 SKILL.md 并提供文件、终端工具的 agent；实时搜索还需要宿主联网与浏览器能力。不依赖 Codex，也不附带模型 API。
 
 详细安装、命令和工具能力映射见 [跨 Agent 指南](jobfinder/references/host-compatibility.md)。
@@ -8,7 +8,7 @@
 
 首次试用：运行 jobfinder/scripts/run.py --workspace <实际目录> init，再按指南执行离线样例。它会生成明确标注为合成数据的十列 Excel；不代表完成了实时招聘搜索。
 
-真实检索按**运行控制器**执行：`start-run` 冻结渠道与阶段（官网 → 招聘平台 → 本地宝网站 → 公众号），循环 `next-action` / `record-action`，最后 `finalize` 给出 `COMPLETE / PARTIAL / WAITING_USER / IN_PROGRESS`。每次检索都要声明 `exhausted`（是否搜到底），官网发现的企业要逐家转成核实任务；预算没用完、线索没核实都不许关阶段。招聘平台必须先在用户可见浏览器里完成登录核验，核验由核心读取页面快照完成，"薪资显示数字"不算登录成功。协议见 [运行控制器协议](jobfinder/references/workflow.md)。
+真实检索按**运行控制器**执行：`start-run` 冻结渠道与阶段（官网 → 招聘平台 → 高校就业网 → 本地宝网站 → 公众号），循环 `next-action` / `record-action`，最后 `finalize` 给出 `COMPLETE / PARTIAL / WAITING_USER / IN_PROGRESS`。每次检索都要声明 `exhausted`（是否搜到底），官网发现的企业要逐家转成核实任务；预算没用完、线索没核实都不许关阶段。预算按**渠道配额**分配（`budget.per_channel`，模板默认官网 10 次、其余渠道各 5 次），渠道之间各花各的额度、互不挤占。招聘平台必须先在用户可见浏览器里完成登录核验，核验由核心读取页面快照完成，"薪资显示数字"不算登录成功。协议见 [运行控制器协议](jobfinder/references/workflow.md)。
 
 **第一次安装请先读完 [首次安装配置清单](jobfinder/references/setup.md)**：按运行环境 / 联网搜索 / 浏览器控制三级逐层自检，做到哪一级只宣称哪一级能力。完成运行环境后，真实检索开始前还需要用户**自己登录**招聘渠道（助手会先打开登录页），未登录时智联薪资显示"-元"、BOSS 返回空壳，结果不可用。
 
