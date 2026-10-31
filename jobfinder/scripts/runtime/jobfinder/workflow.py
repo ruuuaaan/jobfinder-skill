@@ -450,8 +450,13 @@ def next_action(state):
     if state.get("finished"):
         return {"action": "finished", "verdict": state.get("completion", {}).get("verdict")}
 
-    # 0. 渠道没搜到底、预算又还有：必须先继续，不能拿"任务已执行"关阶段。
-    open_work = _incomplete_searches(state, stage) if stage else []
+    # 0. 本阶段还有可执行任务时先执行它们：一个渠道没翻完不该让其他平台干等。
+    #    只有"本阶段没有 pending 任务"时，才轮到下面两道收尾闸门。
+    pending_task = _next_task(state, stage) if stage else None
+    open_work = _incomplete_searches(state, stage) if stage and not pending_task else []
+    lead_gaps = derived_gaps(state, stage) if stage and not pending_task else []
+
+    # 0a. 渠道没搜到底、预算又还有：必须先继续，不能拿"任务已执行"关阶段。
     if open_work:
         task = open_work[0]
         return {"action": "continue_channel", "run_id": state["run_id"], "stage": stage,
@@ -462,7 +467,6 @@ def next_action(state):
                             "重新提交该任务回执并带上 exhausted=true")}
 
     # 0b. 官网发现的企业线索必须逐家核实，没登记就不许往下走。
-    lead_gaps = derived_gaps(state, stage) if stage else []
     if lead_gaps:
         gap = lead_gaps[0]
         return {"action": "register_derived", "run_id": state["run_id"], "stage": stage,
@@ -472,7 +476,7 @@ def next_action(state):
                             f"{gap['registered']} 条核实任务、{gap['waived']} 条不可核实说明；"
                             "请把剩余企业逐家登记为官网核实任务（action=register_derived）")}
 
-    while stage and _stage_is_closable(state, stage):
+    while stage and not open_work and _stage_is_closable(state, stage):
         closed = close_stage(state, stage, persist=False)
         nxt = _advance_stage(state, stage)
         if not nxt:
