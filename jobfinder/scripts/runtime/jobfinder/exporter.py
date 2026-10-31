@@ -159,7 +159,13 @@ def export_bundle(output: Path, config, jobs, results, reports, companies, disco
         conditions.append(["边界", completion.get("boundary", "")])
     sheet(book,"检索条件与说明",["项目","说明"],conditions)
     if completion:
-        rows=[[s.get("label"),s.get("stage"),s.get("status"),s.get("total"),s.get("executed"),
+        # 判定结论放在表头，避免"生成了 Excel"被读成"整轮完成"。
+        rows=[["整轮判定",completion.get("verdict") or ""],
+              ["判定理由","；".join(completion.get("reasons") or []) or "无"],
+              ["下一动作",(completion.get("next_action") or {}).get("action") or "无"],
+              ["导出性质","阶段性导出，未完成渠道见下表" if completion.get("partial_export") else "完整范围导出"]]
+        rows.append([])
+        rows+=[[s.get("label"),s.get("stage"),s.get("status"),s.get("total"),s.get("executed"),
                s.get("blocked"),s.get("skipped_by_user"),s.get("budget_exhausted"),s.get("pending"),
                s.get("closed_at")] for s in completion.get("stages",[])]
         rows+=[[r.get("channel"),r.get("stage"),r.get("status") or "recorded",r.get("total"),r.get("executed"),
