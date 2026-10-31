@@ -989,8 +989,9 @@ def finalize(state, *, persist=True, workspace=None):
         verdict = "COMPLETE"
         reasons.append("声明范围内的阶段与渠道均有可核验的处置结论；不代表该网站全部岗位已查完")
     lead_gaps = derived_gaps(state)
-    if lead_gaps and verdict == "COMPLETE":
-        verdict = "PARTIAL"
+    if lead_gaps:
+        if verdict == "COMPLETE":
+            verdict = "PARTIAL"
         reasons.append("官网发现的企业线索未逐家核实：" +
                        "、".join(f"{g['task_id']} 差 {g['missing']} 家" for g in lead_gaps))
     # 升级前跑的任务、以及旧协议回执，都没有"是否搜到底"的记录：一律按未验证处理。
@@ -998,12 +999,14 @@ def finalize(state, *, persist=True, workspace=None):
                   if t["route"] in EXHAUSTION_ROUTES
                   and t["status"] in ("executed", "budget_exhausted")
                   and t.get("exhausted") is None]
-    if unverified and verdict == "COMPLETE":
-        verdict = "PARTIAL"
+    if unverified:
+        if verdict == "COMPLETE":
+            verdict = "PARTIAL"
         reasons.append(f"{len(unverified)} 条检索未声明是否搜到底（升级前记录或旧协议回执），标记为未验证")
     not_exhausted = [r for r in channel_rows if r.get("not_exhausted")]
-    if not_exhausted and verdict == "COMPLETE":
-        verdict = "PARTIAL"
+    if not_exhausted:
+        if verdict == "COMPLETE":
+            verdict = "PARTIAL"
         reasons.append("以下渠道未声明检索到底（预算已用尽或未继续翻页）：" +
                        "、".join(f"{r['channel']}({r['not_exhausted']} 条)" for r in not_exhausted))
     if uncovered and verdict == "COMPLETE":
