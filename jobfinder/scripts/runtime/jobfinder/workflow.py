@@ -974,7 +974,11 @@ def close_stage(state, stage, *, persist=True, workspace=None):
         raise ValueError("阶段不能关闭：以下渠道未声明检索到底且预算仍有剩余 —— " + names +
                          "；请用 register_derived 派生下一页/下一轮任务继续检索，或补交 exhausted=true 说明已到底")
     # 预算已经用尽的未完成检索，如实记成 budget_exhausted（这是可接受的收尾，但会算成缺口）。
+    # 例外：该渠道已有任一任务声明 exhausted=true（渠道整体跑到尾），前面几页不算缺口。
+    finished_channels = {t["channel"] for t in _stage_tasks(state, stage) if t.get("exhausted") is True}
     for task in _stage_tasks(state, stage):
+        if task["channel"] in finished_channels:
+            continue
         if task["status"] == "executed" and task["route"] in EXHAUSTION_ROUTES and task.get("exhausted") is False \
                 and budget_remaining(state, task.get("target_city")) == 0:
             task["status"] = "budget_exhausted"
@@ -1003,8 +1007,15 @@ def _count(tasks):
     out = {"total": len(tasks), "executed": 0, "blocked": 0, "skipped_by_user": 0,
            "budget_exhausted": 0, "pending": 0, "failed": 0}
     for task in tasks:
-        key = task["status"] if task["status"] in out else "pending"
-        out[key] = out.get(key, 0) + 1
+        status = task["status"]
+        read = status == "executed" or (status == "budget_exhausted"
+                                        and task.get("receipt_status") == "success")
+        if read:
+            out["executed"] += 1
+        if status in out and status != "executed":
+            out[status] += 1
+        elif not read:
+            out["pending"] += 1
     return out
 
 

@@ -76,7 +76,7 @@
   "jobfinder/scripts/runtime/jobfinder/spec.py": "5df40f200705057e14ec7890e2a8fa51a9126d23d5f01a50d7024cd00dead134",
   "jobfinder/scripts/runtime/jobfinder/statistics.py": "3a26ae84e0f8c5939becb853fe99b38acc862d4e10463aa737e4663eac8ead8d",
   "jobfinder/scripts/runtime/jobfinder/traversal.py": "7f30424c654b84ea8a0ea6deb8b4113baf75aea3fa4f4b9463f385b2f0ecd115",
-  "jobfinder/scripts/runtime/jobfinder/workflow.py": "7989edaced33c74200856c9d9680b119487d9565aa7d29c3eaca150a3a0b6a45",
+  "jobfinder/scripts/runtime/jobfinder/workflow.py": "09bde57c34402d0f28c9fbb63ac4900e9af7e983d6cbeea3209aa77cafd8f972",
   "scripts/demo_workflow_trace.py": "787d2637bef789fc86682652ee0d71bc4d87ba3ebbf367edec1ef5b6f3b48aa4",
   "scripts/smoke_release.py": "d307879d6d1abd83641dac4fb62440edbda2436da2442ea66988727b00dca685",
   "scripts/update_manifest.py": "782bbbe4ce1e2254365f0629b31c9a68f2d9afd425da400a0571c821a90b5613",
