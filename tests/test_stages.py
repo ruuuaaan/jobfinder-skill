@@ -126,3 +126,16 @@ class ScopeConfirmationTest(unittest.TestCase):
         completion = run_all_tasks(ws, state)
         self.assertEqual(completion['verdict'], 'COMPLETE')
         self.assertTrue(any('用户明确收窄' in r for r in completion['reasons']))
+
+
+class PersistAdvanceTest(unittest.TestCase):
+    def test_stage_advance_is_persisted_after_last_task(self):
+        ws = workspace()
+        config = make_config(channels=['official_career', '51job'])
+        plan = make_plan(config)
+        state = workflow.start_run(config, plan, ws)
+        for task in tasks_of(state, stage='official'):
+            search(ws, state, task['task_id'])
+        reloaded = workflow.load_state(ws, state['run_id'])
+        self.assertEqual(reloaded['current_stage'], 'recruitment')
+        self.assertEqual(reloaded['stages']['official']['status'], 'closed')

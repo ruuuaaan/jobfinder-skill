@@ -576,9 +576,10 @@ def _record_search(state, payload, workspace):
                           "executed_at": task["executed_at"], "tool": task["search_tool"],
                           "candidate_count": task["candidate_count"], "evidence_ref": task["evidence_ref"]})
     _track_budget(state, task)
+    nxt = next_action(state)   # 可能自动关闭本阶段并推进；必须在落盘前算完
     if workspace:
         save_state(state, workspace)
-    return {"recorded": "search", "task": _public_task(task), "next": next_action(state)}
+    return {"recorded": "search", "task": _public_task(task), "next": nxt}
 
 
 def _track_budget(state, task):
@@ -606,10 +607,10 @@ def _record_auth_open(state, payload, workspace):
     _append_event(state, {"kind": "auth_open", "channel": channel,
                           "browser_context_id": record["browser_context_id"], "tab_id": record["tab_id"],
                           "login_url": record["login_url"]})
+    nxt = next_action(state)
     if workspace:
         save_state(state, workspace)
-    return {"recorded": "auth_open", "channel": channel, "status": "waiting_user",
-            "next": next_action(state)}
+    return {"recorded": "auth_open", "channel": channel, "status": "waiting_user", "next": nxt}
 
 
 def _record_auth_probe(state, payload, workspace):
@@ -622,10 +623,11 @@ def _record_auth_probe(state, payload, workspace):
     _append_event(state, {"kind": "auth_probe", "channel": channel, "status": record["status"],
                           "browser_context_id": record.get("browser_context_id"),
                           "tab_id": record.get("tab_id"), "problems": problems})
+    nxt = next_action(state)
     if workspace:
         save_state(state, workspace)
     result = {"recorded": "auth_probe", "channel": channel, "status": record["status"],
-              "problems": problems, "next": next_action(state)}
+              "problems": problems, "next": nxt}
     if record["status"] != "verified":
         result["message"] = "核验未通过，不得据此放行该平台业务搜索"
     return result
@@ -657,9 +659,10 @@ def _record_skip(state, payload, workspace):
         {"kind": "skip", "channel": channel, "task_id": task_id, "reason": reason, "at": now()})
     _append_event(state, {"kind": "skip", "channel": channel, "task_id": task_id, "reason": reason,
                           "tasks": [t["task_id"] for t in targets]})
+    nxt = next_action(state)
     if workspace:
         save_state(state, workspace)
-    return {"recorded": "skip", "tasks": [t["task_id"] for t in targets], "next": next_action(state)}
+    return {"recorded": "skip", "tasks": [t["task_id"] for t in targets], "next": nxt}
 
 
 def _record_blocked(state, payload, workspace):
@@ -679,10 +682,11 @@ def _record_blocked(state, payload, workspace):
             "checked_at": now(), "reason": reason, "evidence_ref": evidence}
     _append_event(state, {"kind": "blocked", "channel": channel, "reason": reason,
                           "evidence_ref": evidence, "tasks": [t["task_id"] for t in targets]})
+    nxt = next_action(state)
     if workspace:
         save_state(state, workspace)
     return {"recorded": "blocked", "channel": channel, "tasks": [t["task_id"] for t in targets],
-            "next": next_action(state)}
+            "next": nxt}
 
 
 def _record_scope_adjust(state, payload, workspace):
