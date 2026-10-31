@@ -261,3 +261,75 @@ class QueuedPageTest(unittest.TestCase):
         action = workflow.next_action(state)
         self.assertEqual(action['action'], 'search_task')
         self.assertEqual(action['task_id'], research['task_id'])
+
+
+class OfficialVerifyUntilBudgetTest(unittest.TestCase):
+    """有官网链接的企业必须逐家核实，直到官网预算用完。"""
+
+    def test_company_with_url_cannot_be_waived(self):
+        ws = workspace()
+        config = make_config(channels=['official_career'])
+        state = workflow.start_run(config, make_plan(config), ws)
+        research = next(t for t in state['tasks'] if t['route'] == 'research')
+        with self.assertRaises(ValueError) as ctx:
+            workflow.record_action(state, {
+                'action': 'search', 'task_id': research['task_id'], 'status': 'success',
+                'executed_at': '2026-10-31T16:00:00+08:00', 'exhausted': True,
+                'identified': [{'company': '甲公司', 'url': 'https://a.example/careers'},
+                               {'company': '乙公司'}],
+                'candidate_count': 2,
+                'company_waivers': [{'company': '甲公司', 'reason': '懒得看'}]}, ws)
+        self.assertIn('官网链接', str(ctx.exception))
+
+    def test_url_companies_become_verify_tasks_with_url(self):
+        ws = workspace()
+        config = make_config(channels=['official_career'])
+        state = workflow.start_run(config, make_plan(config), ws)
+        research = next(t for t in state['tasks'] if t['route'] == 'research')
+        workflow.record_action(state, {
+            'action': 'search', 'task_id': research['task_id'], 'status': 'success',
+            'executed_at': '2026-10-31T16:01:00+08:00', 'exhausted': True,
+            'identified': [{'company': '甲公司', 'url': 'https://a.example/careers'}],
+            'candidate_count': 1,
+            'derived': [{'company': '甲公司', 'url': 'https://a.example/careers'}]}, ws)
+        kid = state['tasks'][-1]
+        self.assertEqual(kid['route'], 'official_verify')
+        self.assertEqual(kid['company_url'], 'https://a.example/careers')
+
+    def test_official_budget_exhausted_marks_remaining_verify(self):
+        ws = workspace()
+        config = make_config(channels=['official_career'], budget=2)
+        state = workflow.start_run(config, make_plan(config), ws)
+        direct = next(t for t in state['tasks'] if t['route'] == 'direct')
+        research = next(t for t in state['tasks'] if t['route'] == 'research')
+        search(ws, state, direct['task_id'], count=0)
+        search(ws, state, research['task_id'], count=3,
+               identified=['甲', '乙', '丙'],
+               derived=[{'company': '甲'}, {'company': '乙'}, {'company': '丙'}])
+        # 预算 2 已被 direct+research 用光：剩余核实任务不能在关闭时静默消失
+        workflow.close_stage(state, 'official')
+        kids = [t for t in state['tasks'] if t['route'] == 'official_verify']
+        self.assertTrue(all(t['status'] == 'budget_exhausted' for t in kids))
+        self.assertEqual(state['stages']['official']['status'], 'closed_with_gaps')
+
+
+class DeliveryGateTest(unittest.TestCase):
+    def test_delivery_blocked_while_stage_open(self):
+        ws = workspace()
+        config = make_config(channels=['51job', 'bendibao_web'])
+        state = workflow.start_run(config, make_plan(config), ws, user_confirmed_scope=True)
+        task = tasks_of(state, channel='51job')[0]
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        search(ws, state, task['task_id'], exhausted=False)
+        comp = workflow.finalize(state)
+        self.assertFalse(comp['delivery_allowed'])
+        self.assertTrue(comp['delivery_blockers'])
+
+    def test_delivery_allowed_when_all_channels_closed(self):
+        ws = workspace()
+        config = make_config(channels=['51job'])
+        state = workflow.start_run(config, make_plan(config), ws, user_confirmed_scope=True)
+        comp = run_all_tasks(ws, state)
+        self.assertTrue(comp['delivery_allowed'])
+        self.assertEqual(comp['delivery_blockers'], [])

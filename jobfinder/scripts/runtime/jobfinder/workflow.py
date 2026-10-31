@@ -625,6 +625,20 @@ def _assert_auth(state, channel):
         "核验通过后才允许该平台业务搜索")
 
 
+def _normalize_identified(identified):
+    """identified 既可以是企业名，也可以是 {company,url}；统一成 [{company,url}]。"""
+    out = []
+    for item in identified or []:
+        if isinstance(item, dict):
+            name = str(item.get("company") or item.get("name") or "").strip()
+            url = (item.get("url") or "").strip() or None
+        else:
+            name, url = str(item).strip(), None
+        if name:
+            out.append({"company": name, "url": url})
+    return out
+
+
 def _record_search(state, payload, workspace):
     task = _find_task(state, payload.get("task_id"))
     _assert_current_stage(state, task)
@@ -644,6 +658,7 @@ def _record_search(state, payload, workspace):
     identified = payload.get("identified")
     needs_identified = (task["route"] == "research"
                         or int(payload.get("candidate_count") or 0) > 0)
+    normalized_id = _normalize_identified(identified)
     if status == "success" and task["route"] in DISCOVERY_ROUTES and not legacy \
             and needs_identified and identified is None:
         raise ValueError(
@@ -656,7 +671,15 @@ def _record_search(state, payload, workspace):
             "（无更多页/无更多结果 = true；还有后续页或结果 = false）。"
             "渠道要跑到底，不能只跑第一页就关阶段")
     if status == "success" and task["route"] in DISCOVERY_ROUTES and not legacy:
-        found = max(int(payload.get("candidate_count") or 0), len(identified or []))
+        # 识别清单里带官网链接的企业必须逐家核实，不能用"不可核实"豁免掉。
+        by_name = {x["company"]: x.get("url") for x in normalized_id}
+        bad = [w.get("company") for w in waivers if by_name.get(str(w.get("company") or "").strip())]
+        if bad:
+            raise ValueError(
+                "以下企业已找到官网链接，必须逐家核实、不能用 company_waivers 豁免："
+                + "、".join(map(str, bad)) +
+                "；核实到官网预算耗尽为止（读不到就记 blocked 并附失败证据）")
+        found = max(int(payload.get("candidate_count") or 0), len(normalized_id))
         if found > len(derived) + len(waivers):
             raise ValueError(
                 f"官网发现类任务 {task['task_id']} 产出 {found} 条企业线索，但只登记了 "
@@ -686,9 +709,9 @@ def _record_search(state, payload, workspace):
     if waivers:
         task["company_waivers"] = [{"company": w.get("company"), "reason": w.get("reason")}
                                    for w in waivers]
-    if identified is not None:
-        task["identified"] = [str(x).strip() for x in identified if str(x).strip()]
-        task["candidate_count"] = max(int(task.get("candidate_count") or 0), len(task["identified"]))
+    if normalized_id:
+        task["identified"] = normalized_id
+        task["candidate_count"] = max(int(task.get("candidate_count") or 0), len(normalized_id))
     if status == "success" and derived:
         created = _create_derived(state, task, derived, kind="company")
         task["derived_ids"] = list(dict.fromkeys(task.get("derived_ids", []) + created))
@@ -719,6 +742,18 @@ def _track_budget(state, task):
     city = task.get("target_city")
     used = state.setdefault("budget_used", {}).setdefault("searches", {})
     used[city] = used.get(city, 0) + 1
+    # 分阶段账：官网核实要一直做到"官网预算用完"，不能靠总账里别的渠道额度续命。
+    by_stage = state["budget_used"].setdefault("by_stage", {}).setdefault(task["stage"], {})
+    by_stage[city] = by_stage.get(city, 0) + 1
+
+
+def stage_budget_remaining(state, stage, city):
+    """该阶段在该城市还能做几次；None 表示计划未设上限。"""
+    cap = (state.get("scope", {}).get("budget") or {}).get("searches_per_city")
+    if cap is None:
+        return None
+    used = ((state.get("budget_used") or {}).get("by_stage", {}).get(stage, {}) or {}).get(city, 0)
+    return max(0, int(cap) - int(used))
 
 
 def _task_skeleton(source, *, task_id, route, query, company=None, extra=None):
@@ -917,6 +952,12 @@ def _public_task(task):
 
 def close_stage(state, stage, *, persist=True, workspace=None):
     tasks = _stage_tasks(state, stage)
+    # 官网核实任务：预算用尽就不许再挂着，如实转 budget_exhausted（计为缺口，不是"已完成"）。
+    for task in tasks:
+        if task["status"] in ("pending", "failed") and task["route"] == VERIFY_ROUTE \
+                and stage_budget_remaining(state, stage, task.get("target_city")) == 0:
+            task["status"] = "budget_exhausted"
+            task["reason"] = "官网搜索预算已用尽，该企业未完成核实"
     unhandled = [t["task_id"] for t in tasks if t["status"] not in TASK_TERMINAL]
     if unhandled:
         raise ValueError("阶段尚未结束：未处置任务 " + "、".join(unhandled))
@@ -1060,6 +1101,16 @@ def finalize(state, *, persist=True, workspace=None):
                 reasons.append(f"阶段 {row['label']} 尚未关闭")
     if state.get("finished") and verdict == "COMPLETE":
         pass
+    # 出结果闸门：只有所有阶段都收尾（含本地宝与公众号）才允许交付正式结果。
+    stages_open = [r for r in stage_rows if r["status"] not in ("closed", "closed_with_gaps", "closed_empty")]
+    blockers = []
+    if unfinished:
+        blockers.append(f"{len(unfinished)} 个任务未处置：" + "、".join(t["task_id"] for t in unfinished[:6]))
+    if stages_open:
+        blockers.append("阶段未收尾：" + "、".join(f"{r['label']}({r['status']})" for r in stages_open))
+    if not_exhausted:
+        blockers.append("渠道未搜到底：" + "、".join(r["channel"] for r in not_exhausted))
+    delivery_allowed = not blockers and verdict in ("COMPLETE", "PARTIAL")
     completion = {
         "run_id": state["run_id"],
         "protocol_version": PROTOCOL_VERSION,
@@ -1075,6 +1126,8 @@ def finalize(state, *, persist=True, workspace=None):
         "executed_tasks": executed,
         "total_tasks": len(state["tasks"]),
         "partial_export": verdict != "COMPLETE",
+        "delivery_allowed": delivery_allowed,
+        "delivery_blockers": blockers,
         "next_action": None if verdict == "COMPLETE" else next_action(state),
         "boundary": "本判定只覆盖经过本控制器记录的动作；未接入控制器的外部工具动作不在统计内。",
     }

@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.5.3
+
+- **有官网链接必须核实**：`identified` 支持 `{company,url}`；带 url 的企业不能进 `company_waivers`（拒收），只能逐家核实。
+- **官网分阶段预算**：`budget_used.by_stage` 单独计账，核实一直做到官网预算耗尽；耗尽后剩余核实任务转 `budget_exhausted`，阶段 `closed_with_gaps`。
+- **出结果闸门**：`finalize` 增加 `delivery_allowed` / `delivery_blockers`；新增 `gate` 命令（未通过退出码 5）。阶段未收尾（含本地宝、公众号）或渠道未搜到底时不许交付正式结果。
+- 新增 5 个用例，共 64 个用例。
+
 ## 0.5.2
 
 - 官网发现类回执新增必填 `identified`（本轮识别到的企业全名单）；分母改为 `max(candidate_count, len(identified))`。

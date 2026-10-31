@@ -45,6 +45,7 @@
 | `record-action` | 提交实际执行回执 | `--run --input <JSON>` |
 | `close-stage` | 阶段内任务都有处置后关闭阶段 | `[--stage] --run` |
 | `finalize` | 整轮判定；`--close` 允许先自动关闭可关闭阶段 | `[--close] --run [--output]` |
+| `gate` | 出结果闸门：未收尾返回退出码 5 与 blockers | `--run [--output]` |
 
 `finalize` 退出码：`COMPLETE`/`PARTIAL` 为 0，`WAITING_USER`/`IN_PROGRESS` 为 4，便于脚本识别"还没查完"。
 
@@ -60,6 +61,8 @@
 - 阶段关闭还有两道额外闸门（`close-stage` 会直接报错，不只是提示）：
   1. **没搜到底不给关**：存在 `exhausted=false` 且该城市**预算仍有剩余**的任务 → 拒绝关闭，`next-action` 返回 `continue_channel`。要继续就 `register_derived` 派生下一页/下一轮任务；确实到底就重新提交该任务回执并带 `exhausted=true`。
   2. **线索没核实不给关**：`direct/research` 任务产出的企业数 > 已登记核实数 + 不可核实数 → 拒绝关闭，`next-action` 返回 `register_derived`。
+- 官网阶段预算账独立核算（`budget_used.by_stage`）：核实任务一直做到官网预算耗尽，耗尽后剩余核实任务转 `budget_exhausted`，阶段 `closed_with_gaps`。
+- 带官网链接的企业**不能豁免**：`company_waivers` 里出现 `identified` 中有 url 的企业会被拒收。
 - 预算用尽后仍未声明到底的任务，关闭阶段时自动转 `budget_exhausted`（记原因"搜索预算已用尽，检索未到底"），阶段状态为 `closed_with_gaps`，整轮最高 `PARTIAL`。
 - 升级前跑的任务、旧协议回执没有 `exhausted` 字段：允许读取，但标记为未验证，且把 `COMPLETE` 降级为 `PARTIAL`（`N 条检索未声明是否搜到底`）。
 

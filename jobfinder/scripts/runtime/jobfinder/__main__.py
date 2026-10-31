@@ -135,7 +135,7 @@ def main():
                               'order':[c['legal_name'] for c in catalog['companies']],
                               'output':str(local_path(args.output))},ensure_ascii=False))
             return 0
-        if args.command in ('channels','start-run','auth-tabs','next-action','record-action','close-stage','finalize'):
+        if args.command in ('channels','start-run','auth-tabs','next-action','record-action','close-stage','finalize','gate'):
             from . import workflow
             if args.command=='channels':
                 cfg=None
@@ -191,6 +191,13 @@ def main():
                 if args.output:
                     save_new_json(local_path(args.output),result)
                 return 0
+            if args.command=='gate':
+                comp=workflow.finalize(state,workspace=ROOT)
+                payload={'run_id':state['run_id'],'allowed':comp.get('delivery_allowed'),
+                         'verdict':comp['verdict'],'blockers':comp.get('delivery_blockers') or [],
+                         'next_action':comp.get('next_action')}
+                print(json.dumps(payload,ensure_ascii=False))
+                return 0 if payload['allowed'] else 5
             if args.command=='next-action':
                 action=workflow.next_action(state)
                 workflow.save_state(state,ROOT)
