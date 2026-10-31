@@ -22,7 +22,7 @@ def summary_review_note(status, pending, historical=False):
 SOURCE_LABELS = {
     'official_career': '企业官网', 'zhaopin': '智联招聘', 'boss': 'BOSS直聘',
     'liepin': '猎聘', '51job': '前程无忧', 'bendibao_web': '本地宝网站',
-    'bendibao_wechat': '本地宝公众号', 'manual_import': '人工导入',
+    'bendibao_wechat': '本地宝公众号', 'campus_job': '高校就业网', 'manual_import': '人工导入',
 }
 
 
