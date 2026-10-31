@@ -123,6 +123,7 @@ python -m jobfinder finalize --run <run_id>                         # 统一判�
 - `direct/research` 任务报告发现 N 家企业，就必须登记 N 条核实任务（`derived`）或 N 条不可核实说明（`company_waivers`），否则拒收；官网阶段不核实完不许关。
 - 官网发现类回执还必须附 `identified`（本轮识别到的企业**全名单**，可写成 `{company,url}`）。分母取 `max(candidate_count, len(identified))`，所以"我只挑了 8 家来核实"不能把另外 30 家变没。
 - **只要有官网链接就必须核实**：`identified` 里带 `url` 的企业不能进 `company_waivers`（会被拒收），只能逐家核实；核实到**官网阶段预算用完**为止，预算耗尽后未完成的核实自动转 `budget_exhausted` 并计为缺口。
+- **预算要按渠道数配**：7 个渠道全跑到底约需 30 次以上读取（51job 类目 7 页 + 三个平台各 2–3 屏 + 官网核实 + 本地宝/公众号各 1 次）。预算给 20–25 会导致"预算用尽但渠道没到底"，只能按部分覆盖交付；要拿完整结果就把 `searches_per_city` 配到 35–40。
 - **所有渠道收尾后才允许出结果**：`finalize` 输出 `delivery_allowed` 与 `delivery_blockers`；`gate` 命令在未通过时返回退出码 5。阶段未收尾（含本地宝、公众号）或渠道未搜到底时，只能给阶段性文件并标注，不能当成交付。
 - 预算用尽才允许收工，且计为缺口（`PARTIAL`），不能算"跑完"。
 
