@@ -6,7 +6,7 @@
   "private_path_scan": "passed",
   "markdown_links": "passed",
   "note": "Automated checks; not a complete security audit or live-host compatibility certification.",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "package": "jobfinder-skill",
   "workflow_protocol": "workflow-1.1",
   "tests": "python -m unittest discover -s tests -t tests"

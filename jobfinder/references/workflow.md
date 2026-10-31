@@ -69,13 +69,15 @@
 
 | action | 必填 | 说明 |
 |---|---|---|
-| `search` | `task_id`、`status`、`executed_at`、`search_tool`、`candidate_count`、**`exhausted`** | 执行查询或读取入口。`status ∈ success/failed/restricted/budget_exhausted`。`exhausted` 表示该检索是否已到底（无更多页/无更多结果=true）；`route ∈ direct/research/browse_list/channel_search` 时**必填，缺了直接报错**。同一回执重复提交幂等，不重复扣预算 |
+| `search` | `task_id`、`status`、`executed_at`、`search_tool`、`candidate_count`、**`exhausted`**、**`identified`**（官网发现类必填） | 执行查询或读取入口。`status ∈ success/failed/restricted/budget_exhausted`。`exhausted` 表示该检索是否已到底（无更多页/无更多结果=true）；`route ∈ direct/research/browse_list/channel_search` 时**必填，缺了直接报错**。同一回执重复提交幂等，不重复扣预算 |
 | `register_derived` | `task_id`、`items`、`kind`（company/page） | 把发现到的企业线索或后续页登记成任务。`kind=company` 生成同阶段的 `official_verify` 核实任务；`kind=page` 生成下一页任务并让父任务交出"到底"义务 |
 | `auth_open` | `channel`、`browser_context_id`、`tab_id` | 打开登录入口，转 `waiting_user` |
 | `auth_probe` | `channel`、`browser_context_id`、`tab_id`、`snapshot_path`、`url` | 提交登录核验；核心自己读快照、算哈希、匹配标记 |
 | `skip` | `channel` 或 `task_id`、`user_confirmed=true`、`reason` | 用户明确跳过的渠道/任务 |
 | `blocked` | `channel`、`evidence_ref`、`reason` | 受阻，必须带能力检测或访问失败证据 |
 | `scope_adjust` | `user_confirmed=true`、`detail` | 用户明确调整范围 |
+
+**`identified` 是核算分母。**官网发现类检索（`research`，或 `candidate_count>0` 的 `direct`）必须附 `identified`：这次检索里识别到的**企业全名单**，哪怕不打算核实也要列出来。程序用 `max(candidate_count, len(identified))` 作为分母核对，`candidate_count` 少报不能减少要处置的企业数。实测教训：只报"我挑了 8 家"、把另外 30 多家写成一句"交由平台渠道覆盖"，会让整轮看起来像跑完了。
 
 **官网发现的企业线索必须逐家登记核实任务。**`route ∈ direct/research` 的 `search` 回执，只要 `candidate_count > registered(derived) + waived(company_waivers)`，核心直接拒收：要么在 `derived` 里列出企业（自动生成同阶段 `official_verify` 任务），要么在 `company_waivers` 里逐条给不可核实的理由。没有第三条路可以绕过。
 

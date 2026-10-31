@@ -81,7 +81,7 @@ def auth_probe(ws, state, channel, snapshot_text, *, context='ctx-1', tab='tab-1
 
 
 def search(ws, state, task_id, status='success', executed_at=None, count=0, *, exhausted=True,
-           derived=None, waivers=None):
+           derived=None, waivers=None, identified=None):
     """默认按"该检索已到底"提交；测管道未跑完时显式传 exhausted=False。"""
     from jobfinder import workflow
     payload = {'action': 'search', 'task_id': task_id, 'status': status,
@@ -89,6 +89,11 @@ def search(ws, state, task_id, status='success', executed_at=None, count=0, *, e
                'candidate_count': count}
     if exhausted is not None:
         payload['exhausted'] = exhausted
+    if identified is not None:
+        payload['identified'] = identified
+    elif derived is None and waivers is None and count == 0:
+        # 默认声明"这次检索没有识别到需要处置的企业"
+        payload['identified'] = []
     if derived:
         payload['derived'] = derived
     if waivers:

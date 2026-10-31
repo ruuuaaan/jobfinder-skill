@@ -207,7 +207,25 @@ class ExhaustionGateTest(unittest.TestCase):
         state = workflow.start_run(config, make_plan(config), ws)
         research = next(t for t in state['tasks'] if t['route'] == 'research')
         with self.assertRaises(ValueError) as ctx:
-            search(ws, state, research['task_id'], count=2)
+            workflow.record_action(state, {'action': 'search', 'task_id': research['task_id'],
+                                           'status': 'success',
+                                           'executed_at': '2026-10-31T15:00:00+08:00',
+                                           'candidate_count': 2, 'exhausted': True}, ws)
+        self.assertIn('identified', str(ctx.exception))
+
+    def test_identified_list_is_the_denominator(self):
+        ws = workspace()
+        config = make_config(channels=['official_career'])
+        state = workflow.start_run(config, make_plan(config), ws)
+        research = next(t for t in state['tasks'] if t['route'] == 'research')
+        # 只登记 1 家，但识别清单里有 3 家 → 按 3 家核算，拒收
+        with self.assertRaises(ValueError) as ctx:
+            workflow.record_action(state, {'action': 'search', 'task_id': research['task_id'],
+                                           'status': 'success',
+                                           'executed_at': '2026-10-31T15:01:00+08:00',
+                                           'candidate_count': 1, 'exhausted': True,
+                                           'identified': ['甲', '乙', '丙'],
+                                           'derived': [{'company': '甲'}]}, ws)
         self.assertIn('核实任务', str(ctx.exception))
 
     def test_derived_verify_tasks_block_official_stage_until_done(self):
@@ -216,7 +234,7 @@ class ExhaustionGateTest(unittest.TestCase):
         state = workflow.start_run(config, make_plan(config), ws)
         direct = next(t for t in state['tasks'] if t['route'] == 'direct')
         research = next(t for t in state['tasks'] if t['route'] == 'research')
-        search(ws, state, direct['task_id'], count=2,
+        search(ws, state, direct['task_id'], count=2, identified=['甲企业', '乙企业'],
                derived=[{'company': '甲企业'}, {'company': '乙企业'}])
         self.assertEqual(len(direct['derived_ids']), 2)
         search(ws, state, research['task_id'], count=0)

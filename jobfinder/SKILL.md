@@ -3,7 +3,7 @@ name: jobfinder
 description: 检索中国大陆指定城市的岗位，复用企业官网、招聘站列表页直读与站内搜索、人才服务平台、本地宝网站及公众号等已实测渠道的方法，核验岗位原文、学历门槛与投递入口，维护企业资源库并导出Excel。支持新检索、刷新和公告反查企业；不自动投递。
 license: MIT
 metadata:
-  version: "0.5.1"
+  version: "0.5.2"
   compatibility: "Python 3.11+; file and terminal tools; host search/browser for live collection."
 ---
 
@@ -121,6 +121,7 @@ python -m jobfinder finalize --run <run_id>                         # 统一判�
 **渠道要跑到底，线索要逐家核实——这两条也是程序控制的**：
 - 任何 `direct/research/browse_list/channel_search` 回执缺少 `exhausted` 会被拒收；`exhausted=false` 且预算还有剩余时，`close-stage` 直接失败，`next-action` 只会给 `continue_channel`。
 - `direct/research` 任务报告发现 N 家企业，就必须登记 N 条核实任务（`derived`）或 N 条不可核实说明（`company_waivers`），否则拒收；官网阶段不核实完不许关。
+- 官网发现类回执还必须附 `identified`（本轮识别到的企业**全名单**）。分母取 `max(candidate_count, len(identified))`，所以"我只挑了 8 家来核实"不能把另外 30 家变没。
 - 预算用尽才允许收工，且计为缺口（`PARTIAL`），不能算"跑完"。
 
 **阶段顺序是程序控制的**：当前阶段未关闭时，后一阶段的任务回执会被直接拒绝，并返回当前允许的动作。官网阶段发现的派生企业任务（`official-catalog` → `official-plan`、`extend-plan`、`follow-up-plan`）**并入官网阶段**，不能推到其他渠道之后再处理。

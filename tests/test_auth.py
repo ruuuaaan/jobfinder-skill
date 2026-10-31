@@ -178,7 +178,7 @@ class TaskLevelBlockedTest(unittest.TestCase):
         state = workflow.start_run(config, make_plan(config), ws)
         direct = next(t for t in state['tasks'] if t['route'] == 'direct')
         research = next(t for t in state['tasks'] if t['route'] == 'research')
-        search(ws, state, direct['task_id'], count=2,
+        search(ws, state, direct['task_id'], count=2, identified=['甲企业', '乙企业'],
                derived=[{'company': '甲企业'}, {'company': '乙企业'}])
         kids = state['tasks'][-2:]
         workflow.record_action(state, {'action': 'blocked', 'channel': 'official_career',

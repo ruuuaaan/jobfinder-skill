@@ -433,7 +433,7 @@ def derived_gaps(state, stage=None):
             continue
         if task["route"] not in DISCOVERY_ROUTES or task["status"] != "executed":
             continue
-        found = int(task.get("candidate_count") or 0)
+        found = max(int(task.get("candidate_count") or 0), len(task.get("identified") or []))
         registered = len(task.get("derived_ids") or [])
         waived = len(task.get("company_waivers") or [])
         if found > registered + waived:
@@ -641,13 +641,22 @@ def _record_search(state, payload, workspace):
     derived = payload.get("derived") or []
     waivers = payload.get("company_waivers") or []
     legacy = bool(payload.get("legacy_receipt"))
+    identified = payload.get("identified")
+    needs_identified = (task["route"] == "research"
+                        or int(payload.get("candidate_count") or 0) > 0)
+    if status == "success" and task["route"] in DISCOVERY_ROUTES and not legacy \
+            and needs_identified and identified is None:
+        raise ValueError(
+            f"任务 {task['task_id']} 是官网发现类检索，必须附 identified：检索中识别到的企业全名单"
+            "（哪怕不打算核实也要列出来，用 company_waivers 说明原因）。"
+            "candidate_count 只统计你打算处置的企业，程序用 identified 核对有没有漏")
     if status == "success" and task["route"] in EXHAUSTION_ROUTES and payload.get("exhausted") is None and not legacy:
         raise ValueError(
             f"任务 {task['task_id']} 未声明 exhausted：必须说明该检索是否已到底"
             "（无更多页/无更多结果 = true；还有后续页或结果 = false）。"
             "渠道要跑到底，不能只跑第一页就关阶段")
     if status == "success" and task["route"] in DISCOVERY_ROUTES and not legacy:
-        found = int(payload.get("candidate_count") or 0)
+        found = max(int(payload.get("candidate_count") or 0), len(identified or []))
         if found > len(derived) + len(waivers):
             raise ValueError(
                 f"官网发现类任务 {task['task_id']} 产出 {found} 条企业线索，但只登记了 "
@@ -677,6 +686,9 @@ def _record_search(state, payload, workspace):
     if waivers:
         task["company_waivers"] = [{"company": w.get("company"), "reason": w.get("reason")}
                                    for w in waivers]
+    if identified is not None:
+        task["identified"] = [str(x).strip() for x in identified if str(x).strip()]
+        task["candidate_count"] = max(int(task.get("candidate_count") or 0), len(task["identified"]))
     if status == "success" and derived:
         created = _create_derived(state, task, derived, kind="company")
         task["derived_ids"] = list(dict.fromkeys(task.get("derived_ids", []) + created))
