@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .models import now, SHANGHAI
 
-PROTOCOL_VERSION = "workflow-1"
+PROTOCOL_VERSION = "workflow-1.1"
 
 # 全局阶段顺序：官网 → 招聘平台 → 本地宝网站 → 公众号。
 # 同一阶段内可以按预算轮转城市/平台/任务；跨阶段不得抢跑。
@@ -47,6 +47,13 @@ CHANNEL_STAGE = {
 PLATFORM_CHANNELS = ("zhaopin", "boss", "liepin", "51job", "linkedin")
 # 非检索类渠道：不进入阶段任务簿，只表示人工材料来源。
 NON_STAGE_CHANNELS = ("manual_import",)
+
+# 必须声明"检索是否到底"的路由：任何一条成功回执都要给 exhausted。
+# 未声明 → 直接拒绝；声明 false 且预算仍有剩余 → 阶段不许关闭，必须继续翻页/换词。
+EXHAUSTION_ROUTES = ("direct", "research", "browse_list", "channel_search")
+# 官网发现类路由：产出的每一条企业线索都必须转成官网核实任务，或给出不可核实的书面理由。
+DISCOVERY_ROUTES = ("direct", "research")
+VERIFY_ROUTE = "official_verify"
 
 # 渠道菜单：技能实际支持的检索渠道及其能力差异。agent 必须把这张表呈现给用户选择，
 # 不能只按配置文件里的 sources 悄悄决定跑哪些渠道。
@@ -208,6 +215,10 @@ def start_run(config, plan, workspace, *, channels=None, public_only=False,
         "previous_run": previous_run,
         "platform_auth_required": policy == "required",
     }
+    # 预算上限冻结进运行状态：后续判断"还能不能继续搜"只认这里的值。
+    plan_budget = (plan.get("effective_config") or {}).get("budget") or {}
+    state["scope"]["budget"] = {"searches_per_city": plan_budget.get("searches_per_city"),
+                                "companies_per_city": plan_budget.get("companies_per_city")}
     # 范围覆盖度：只覆盖部分阶段时，必须区分"用户明确只要这些"与"助手自行收窄"。
     covered = set(state["scope"]["stage_order"])
     missing = [s for s in STAGES if s not in covered]
@@ -380,12 +391,81 @@ def _platform_auth_blocked_by_policy(state, channel):
 
 # ---------------------------------------------------------------- 下一动作
 
+def budget_remaining(state, city):
+    """该城市还能搜几次；None 表示计划未设上限。"""
+    cap = (state.get("scope", {}).get("budget") or {}).get("searches_per_city")
+    if cap is None:
+        return None
+    used = (state.get("budget_used") or {}).get("searches", {}).get(city, 0)
+    return max(0, int(cap) - int(used))
+
+
+def _incomplete_searches(state, stage):
+    """已执行、但没声明"检索到底"而预算又没用完的任务。
+
+    这些任务意味着渠道没跑完：既不能关阶段，也不能靠"任务 executed"混过去。
+    """
+    out = []
+    for task in _stage_tasks(state, stage):
+        if task["status"] != "executed":
+            continue
+        if task["route"] not in EXHAUSTION_ROUTES:
+            continue
+        if task.get("exhausted") is not False or task.get("continued"):
+            continue
+        if budget_remaining(state, task.get("target_city")) == 0:
+            continue
+        out.append(task)
+    return out
+
+
+def derived_gaps(state, stage=None):
+    """官网发现类任务里，产出企业线索但没转成核实任务、也没给不可核实理由的账。"""
+    out = []
+    for task in state["tasks"]:
+        if stage and task["stage"] != stage:
+            continue
+        if task["route"] not in DISCOVERY_ROUTES or task["status"] != "executed":
+            continue
+        found = int(task.get("candidate_count") or 0)
+        registered = len(task.get("derived_ids") or [])
+        waived = len(task.get("company_waivers") or [])
+        if found > registered + waived:
+            out.append({"task_id": task["task_id"], "channel": task["channel"],
+                        "found": found, "registered": registered, "waived": waived,
+                        "missing": found - registered - waived})
+    return out
+
+
 def next_action(state):
     """返回当前唯一合法的下一动作；调用方不得自行挑选方便的渠道。"""
     order = state["scope"]["stage_order"]
     stage = state.get("current_stage")
     if state.get("finished"):
         return {"action": "finished", "verdict": state.get("completion", {}).get("verdict")}
+
+    # 0. 渠道没搜到底、预算又还有：必须先继续，不能拿"任务已执行"关阶段。
+    open_work = _incomplete_searches(state, stage) if stage else []
+    if open_work:
+        task = open_work[0]
+        return {"action": "continue_channel", "run_id": state["run_id"], "stage": stage,
+                "task_id": task["task_id"], "channel": task["channel"], "route": task["route"],
+                "budget_remaining": budget_remaining(state, task.get("target_city")),
+                "message": ("该渠道的检索未声明到底，且搜索预算仍有剩余：如还有下一页/下一批结果，"
+                            "用 action=register_derived 派生后续页任务并继续；若确实已到底，"
+                            "重新提交该任务回执并带上 exhausted=true")}
+
+    # 0b. 官网发现的企业线索必须逐家核实，没登记就不许往下走。
+    lead_gaps = derived_gaps(state, stage) if stage else []
+    if lead_gaps:
+        gap = lead_gaps[0]
+        return {"action": "register_derived", "run_id": state["run_id"], "stage": stage,
+                "task_id": gap["task_id"], "channel": gap["channel"],
+                "missing": gap["missing"],
+                "message": (f"{gap['task_id']} 产出 {gap['found']} 条企业线索，只登记了 "
+                            f"{gap['registered']} 条核实任务、{gap['waived']} 条不可核实说明；"
+                            "请把剩余企业逐家登记为官网核实任务（action=register_derived）")}
+
     while stage and _stage_is_closable(state, stage):
         closed = close_stage(state, stage, persist=False)
         nxt = _advance_stage(state, stage)
@@ -482,7 +562,7 @@ def _advance_stage(state, stage):
 
 PLAN_FIELDS = ("task_id", "query", "target_city", "role_keyword", "channel", "route", "stage", "company")
 RECEIPT_ALLOWED = ("status", "search_tool", "executed_at", "candidate_count", "evidence_ref",
-                   "reason", "search_mode", "lead_only")
+                   "reason", "search_mode", "lead_only", "exhausted", "derived", "company_waivers")
 
 
 def record_action(state, payload, workspace=None):
@@ -498,6 +578,8 @@ def record_action(state, payload, workspace=None):
         return _record_skip(state, payload, workspace)
     if action in ("blocked", "channel_blocked"):
         return _record_blocked(state, payload, workspace)
+    if action in ("register_derived", "derive", "register_candidates"):
+        return _record_derived(state, payload, workspace)
     if action == "scope_adjust":
         return _record_scope_adjust(state, payload, workspace)
     raise ValueError("未知动作：" + str(action))
@@ -546,6 +628,22 @@ def _record_search(state, payload, workspace):
         raise ValueError("未知执行状态：" + str(status))
     if status in ("success", "failed", "restricted") and not payload.get("executed_at"):
         raise ValueError("实际执行必须带 executed_at；未执行的查询不能记为执行过")
+    derived = payload.get("derived") or []
+    waivers = payload.get("company_waivers") or []
+    legacy = bool(payload.get("legacy_receipt"))
+    if status == "success" and task["route"] in EXHAUSTION_ROUTES and payload.get("exhausted") is None and not legacy:
+        raise ValueError(
+            f"任务 {task['task_id']} 未声明 exhausted：必须说明该检索是否已到底"
+            "（无更多页/无更多结果 = true；还有后续页或结果 = false）。"
+            "渠道要跑到底，不能只跑第一页就关阶段")
+    if status == "success" and task["route"] in DISCOVERY_ROUTES and not legacy:
+        found = int(payload.get("candidate_count") or 0)
+        if found > len(derived) + len(waivers):
+            raise ValueError(
+                f"官网发现类任务 {task['task_id']} 产出 {found} 条企业线索，但只登记了 "
+                f"{len(derived)} 条核实任务、{len(waivers)} 条不可核实说明。"
+                "研究型检索得到的企业必须逐家转成官网核实任务（derived），"
+                "无法核实的要写进 company_waivers 并给理由")
     # 幂等：同一条回执重复提交不重复扣预算、不重复改证据时间。
     receipt_hash = hashlib.sha256(json.dumps(
         {k: payload.get(k) for k in ("task_id", "status", "executed_at", "search_tool", "candidate_count")},
@@ -561,6 +659,17 @@ def _record_search(state, payload, workspace):
     task["evidence_ref"] = payload.get("evidence_ref")
     task["reason"] = payload.get("reason")
     task["receipt_status"] = status
+    if payload.get("exhausted") is not None:
+        task["exhausted"] = bool(payload["exhausted"])
+    elif legacy:
+        task["legacy_exhaustion"] = True
+        task["exhaustion_note"] = "历史回执未声明检索是否到底，按旧协议接受但不算新版检查通过"
+    if waivers:
+        task["company_waivers"] = [{"company": w.get("company"), "reason": w.get("reason")}
+                                   for w in waivers]
+    if status == "success" and derived:
+        created = _create_derived(state, task, derived, kind="company")
+        task["derived_ids"] = list(dict.fromkeys(task.get("derived_ids", []) + created))
     if status == "success":
         task["status"] = "executed"
     elif status == "budget_exhausted":
@@ -588,6 +697,70 @@ def _track_budget(state, task):
     city = task.get("target_city")
     used = state.setdefault("budget_used", {}).setdefault("searches", {})
     used[city] = used.get(city, 0) + 1
+
+
+def _task_skeleton(source, *, task_id, route, query, company=None, extra=None):
+    row = {"task_id": task_id, "target_city": source.get("target_city"),
+           "role_keyword": source.get("role_keyword"), "query": query, "route": route,
+           "channel": source["channel"], "stage": source["stage"], "company": company,
+           "planned_status": "derived", "status": "pending", "attempts": 0,
+           "executed_at": None, "search_tool": None, "candidate_count": 0, "evidence_ref": None,
+           "reason": None, "derived_from": source["task_id"], "browse_page": None,
+           "browse_url": None, "covers_roles": None, "skipped_stage": False, "exhausted": None}
+    if extra:
+        row.update(extra)
+    return row
+
+
+def _create_derived(state, source, items, kind="company"):
+    """派生任务与来源任务同阶段：官网线索只能回到官网阶段核实，不能被推到别的渠道后面。"""
+    created = []
+    for item in items:
+        seq = len(source.get("derived_ids", [])) + len(created) + 1
+        if kind == "page":
+            task_id = f'{source["task_id"]}-p{seq}'
+            row = _task_skeleton(source, task_id=task_id, route=source["route"],
+                                 query=item.get("url") or source["query"],
+                                 extra={"browse_url": item.get("url"),
+                                        "browse_page": item.get("page")})
+        else:
+            name = (item.get("company") or item.get("name") or "").strip()
+            if not name:
+                raise ValueError("派生核实任务必须给出企业名称")
+            task_id = f'{source["task_id"]}-c{seq}'
+            row = _task_skeleton(source, task_id=task_id, route=VERIFY_ROUTE,
+                                 query=f'{name} {source.get("target_city") or ""} '
+                                       f'{source.get("role_keyword") or ""} 官网 招聘'.replace("  ", " "),
+                                 company=name, extra={"company_url": item.get("url")})
+        if any(t["task_id"] == task_id for t in state["tasks"]):
+            continue
+        state["tasks"].append(row)
+        state.setdefault("derived_tasks", []).append({"task_id": task_id, "from": source["task_id"],
+                                                      "kind": kind, "at": now()})
+        created.append(task_id)
+    _append_event(state, {"kind": "register_derived", "source": source["task_id"],
+                          "kind": kind, "tasks": created})
+    return created
+
+
+def _record_derived(state, payload, workspace):
+    """把发现到的企业线索/后续页登记为任务；不执行，只入簿。"""
+    source = _find_task(state, payload.get("task_id"))
+    if source["stage"] != state.get("current_stage"):
+        raise ValueError("只能在当前阶段登记派生任务")
+    items = payload.get("items") or []
+    kind = payload.get("kind") or "company"
+    if not items:
+        raise ValueError("register_derived 需要 items：[{company,url}] 或 [{url,page}]")
+    created = _create_derived(state, source, items, kind=kind)
+    source["derived_ids"] = list(dict.fromkeys(source.get("derived_ids", []) + created))
+    if kind == "page" and created:
+        # 后续页由新任务承接"是否到底"，父任务不再重复计缺口。
+        source["continued"] = True
+    nxt = next_action(state)
+    if workspace:
+        save_state(state, workspace)
+    return {"recorded": "register_derived", "source": source["task_id"], "created": created, "next": nxt}
 
 
 def _record_auth_open(state, payload, workspace):
@@ -702,8 +875,12 @@ def _record_scope_adjust(state, payload, workspace):
 
 
 def _public_task(task):
-    return {k: task.get(k) for k in ("task_id", "stage", "channel", "route", "status", "attempts",
-                                     "executed_at", "candidate_count", "reason")}
+    out = {k: task.get(k) for k in ("task_id", "stage", "channel", "route", "status", "attempts",
+                                    "executed_at", "candidate_count", "reason")}
+    out["exhausted"] = task.get("exhausted")
+    if task.get("derived_ids"):
+        out["derived_ids"] = list(task["derived_ids"])
+    return out
 
 
 # ---------------------------------------------------------------- 阶段与整轮
@@ -713,6 +890,25 @@ def close_stage(state, stage, *, persist=True, workspace=None):
     unhandled = [t["task_id"] for t in tasks if t["status"] not in TASK_TERMINAL]
     if unhandled:
         raise ValueError("阶段尚未结束：未处置任务 " + "、".join(unhandled))
+    # 预算还有却没声明搜到底 → 不许关阶段，先把该渠道跑干净。
+    open_work = _incomplete_searches(state, stage)
+    if open_work:
+        names = "、".join(f"{t['task_id']}({t['channel']}, 余 {budget_remaining(state, t.get('target_city'))} 次)"
+                         for t in open_work)
+        raise ValueError("阶段不能关闭：以下渠道未声明检索到底且预算仍有剩余 —— " + names +
+                         "；请用 register_derived 派生下一页/下一轮任务继续检索，或补交 exhausted=true 说明已到底")
+    # 预算已经用尽的未完成检索，如实记成 budget_exhausted（这是可接受的收尾，但会算成缺口）。
+    for task in _stage_tasks(state, stage):
+        if task["status"] == "executed" and task["route"] in EXHAUSTION_ROUTES and task.get("exhausted") is False \
+                and budget_remaining(state, task.get("target_city")) == 0:
+            task["status"] = "budget_exhausted"
+            task["reason"] = "搜索预算已用尽，检索未到底"
+    # 官网发现的企业线索没转成核实任务 → 不许关阶段。
+    gaps = derived_gaps(state, stage)
+    if gaps:
+        detail = "、".join(f"{g['task_id']} 还差 {g['missing']} 家" for g in gaps)
+        raise ValueError("阶段不能关闭：官网发现的企业线索未逐家核实 —— " + detail +
+                         "；请用 register_derived 登记核实任务，或对这些企业给出 company_waivers 理由")
     statuses = {t["status"] for t in tasks}
     status = "closed"
     if "blocked" in statuses or "skipped_by_user" in statuses or "budget_exhausted" in statuses:
@@ -753,6 +949,9 @@ def finalize(state, *, persist=True, workspace=None):
         auth = auth_status(state, channel) if channel in PLATFORM_CHANNELS else "not_required"
         reasons = sorted({t.get("reason") for t in tasks if t.get("reason")})
         channel_rows.append({"channel": channel, "stage": channel_stage(channel), **counts,
+                             "not_exhausted": sum(1 for t in tasks
+                                                  if t.get("exhausted") is False and not t.get("continued")
+                                                  and t["status"] in ("executed", "budget_exhausted")),
                              "status": "not_covered" if counts["total"] == 0 else "recorded",
                              "auth_status": auth,
                              "auth_checked_at": (state.get("auth", {}).get(channel) or {}).get("checked_at"),
@@ -789,6 +988,24 @@ def finalize(state, *, persist=True, workspace=None):
     else:
         verdict = "COMPLETE"
         reasons.append("声明范围内的阶段与渠道均有可核验的处置结论；不代表该网站全部岗位已查完")
+    lead_gaps = derived_gaps(state)
+    if lead_gaps and verdict == "COMPLETE":
+        verdict = "PARTIAL"
+        reasons.append("官网发现的企业线索未逐家核实：" +
+                       "、".join(f"{g['task_id']} 差 {g['missing']} 家" for g in lead_gaps))
+    # 升级前跑的任务、以及旧协议回执，都没有"是否搜到底"的记录：一律按未验证处理。
+    unverified = [t for t in state["tasks"]
+                  if t["route"] in EXHAUSTION_ROUTES
+                  and t["status"] in ("executed", "budget_exhausted")
+                  and t.get("exhausted") is None]
+    if unverified and verdict == "COMPLETE":
+        verdict = "PARTIAL"
+        reasons.append(f"{len(unverified)} 条检索未声明是否搜到底（升级前记录或旧协议回执），标记为未验证")
+    not_exhausted = [r for r in channel_rows if r.get("not_exhausted")]
+    if not_exhausted and verdict == "COMPLETE":
+        verdict = "PARTIAL"
+        reasons.append("以下渠道未声明检索到底（预算已用尽或未继续翻页）：" +
+                       "、".join(f"{r['channel']}({r['not_exhausted']} 条)" for r in not_exhausted))
     if uncovered and verdict == "COMPLETE":
         verdict = "PARTIAL"
         reasons.append("以下启用渠道没有任何任务与执行记录，不能计入完成：" + "、".join(uncovered))
@@ -919,6 +1136,9 @@ def merge_receipt(state, receipt, config, plan):
             continue
         payload = {k: log.get(k) for k in RECEIPT_ALLOWED if log.get(k) is not None}
         payload.update(action="search", task_id=log["task_id"])
+        if log.get("exhausted") is None:
+            # 旧协议回执没有"是否到底"字段：允许入库，但标成历史未验证，不能算新版检查通过。
+            payload["legacy_receipt"] = True
         _record_search(state, payload, None)
         recorded.append(log["task_id"])
     return logs, recorded

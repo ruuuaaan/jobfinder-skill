@@ -77,7 +77,8 @@ class ReceiptTest(unittest.TestCase):
         open_auth(self.ws, state, '51job')
         auth_probe(self.ws, state, '51job', LOGGED_IN_51JOB)
         payload = {'action': 'search', 'task_id': task['task_id'], 'status': 'success',
-                   'executed_at': now(), 'search_tool': 'x', 'candidate_count': 0}
+                   'executed_at': now(), 'search_tool': 'x', 'candidate_count': 0,
+                   'exhausted': True}
         workflow.record_action(state, dict(payload), self.ws)
         used = state['budget_used']['searches']['北京']
         workflow.record_action(state, dict(payload), self.ws)

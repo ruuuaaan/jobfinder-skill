@@ -1,4 +1,4 @@
-# 运行控制器协议（workflow-1）
+# 运行控制器协议（workflow-1.1）
 
 适用版本：Skill 0.5.0 起。控制器实现见 `scripts/runtime/jobfinder/workflow.py` 与 `platform_auth.py`。
 本协议只约束**经过本项目入口**的动作，边界见文末。
@@ -57,6 +57,11 @@
 - 任务状态：`pending`、`executed`、`failed`（可重试）、`blocked`、`skipped_by_user`、`budget_exhausted`。终止态只有后四个中的 `executed/blocked/skipped_by_user/budget_exhausted`。
 - 单任务最多尝试 2 次，之后转 `blocked`（原因附"重试耗尽"），阶段其余任务继续。
 - `not_run`/缺失记录**不能**作为关闭阶段的依据：阶段关闭要求所有任务进入终止态。
+- 阶段关闭还有两道额外闸门（`close-stage` 会直接报错，不只是提示）：
+  1. **没搜到底不给关**：存在 `exhausted=false` 且该城市**预算仍有剩余**的任务 → 拒绝关闭，`next-action` 返回 `continue_channel`。要继续就 `register_derived` 派生下一页/下一轮任务；确实到底就重新提交该任务回执并带 `exhausted=true`。
+  2. **线索没核实不给关**：`direct/research` 任务产出的企业数 > 已登记核实数 + 不可核实数 → 拒绝关闭，`next-action` 返回 `register_derived`。
+- 预算用尽后仍未声明到底的任务，关闭阶段时自动转 `budget_exhausted`（记原因"搜索预算已用尽，检索未到底"），阶段状态为 `closed_with_gaps`，整轮最高 `PARTIAL`。
+- 升级前跑的任务、旧协议回执没有 `exhausted` 字段：允许读取，但标记为未验证，且把 `COMPLETE` 降级为 `PARTIAL`（`N 条检索未声明是否搜到底`）。
 
 ## 4. 回执
 
@@ -64,12 +69,15 @@
 
 | action | 必填 | 说明 |
 |---|---|---|
-| `search` | `task_id`、`status`、`executed_at`、`search_tool`、`candidate_count` | 执行查询或读取入口。`status ∈ success/failed/restricted/budget_exhausted`。同一回执重复提交幂等，不重复扣预算 |
+| `search` | `task_id`、`status`、`executed_at`、`search_tool`、`candidate_count`、**`exhausted`** | 执行查询或读取入口。`status ∈ success/failed/restricted/budget_exhausted`。`exhausted` 表示该检索是否已到底（无更多页/无更多结果=true）；`route ∈ direct/research/browse_list/channel_search` 时**必填，缺了直接报错**。同一回执重复提交幂等，不重复扣预算 |
+| `register_derived` | `task_id`、`items`、`kind`（company/page） | 把发现到的企业线索或后续页登记成任务。`kind=company` 生成同阶段的 `official_verify` 核实任务；`kind=page` 生成下一页任务并让父任务交出"到底"义务 |
 | `auth_open` | `channel`、`browser_context_id`、`tab_id` | 打开登录入口，转 `waiting_user` |
 | `auth_probe` | `channel`、`browser_context_id`、`tab_id`、`snapshot_path`、`url` | 提交登录核验；核心自己读快照、算哈希、匹配标记 |
 | `skip` | `channel` 或 `task_id`、`user_confirmed=true`、`reason` | 用户明确跳过的渠道/任务 |
 | `blocked` | `channel`、`evidence_ref`、`reason` | 受阻，必须带能力检测或访问失败证据 |
 | `scope_adjust` | `user_confirmed=true`、`detail` | 用户明确调整范围 |
+
+**官网发现的企业线索必须逐家登记核实任务。**`route ∈ direct/research` 的 `search` 回执，只要 `candidate_count > registered(derived) + waived(company_waivers)`，核心直接拒收：要么在 `derived` 里列出企业（自动生成同阶段 `official_verify` 任务），要么在 `company_waivers` 里逐条给不可核实的理由。没有第三条路可以绕过。
 
 回执**只能**提交结果字段；`task_id/query/target_city/role_keyword/channel/route/stage/company` 是计划字段，被回执改写会直接报错。合并时计划字段恒为准，回执多余字段被忽略。
 
@@ -95,10 +103,11 @@
 | `WAITING_USER` | 仍有 `pending` 任务，或仍有平台未完成登录核验 |
 | `IN_PROGRESS` | 仍有非 `pending` 的未处置任务（如失败待重试） |
 | `PARTIAL` | 有 `blocked`/`skipped_by_user`/`budget_exhausted` 缺口；或本轮零执行；或启用渠道完全没有任务记录；或阶段未关闭 |
-| `COMPLETE` | 声明范围内所有任务终止、所有渠道有处置、无缺口 |
+| `COMPLETE` | 声明范围内所有任务终止、所有渠道有处置、**所有检索都声明了 `exhausted`、官网线索全部核实或书面豁免**、无缺口 |
 
 补充规则：
 
+- `channels[*].not_exhausted` 统计该渠道未声明搜到底的任务数，非零时不会判 `COMPLETE`。
 - 配置里启用但本轮没有任何任务的渠道，会以 `not_covered` 出现在 `channels` 中，并把 `COMPLETE` 降级为 `PARTIAL`（渠道级报告 `url=None` 也必须参与判定）。
 - 浏览器采集（`process-browser`）只是官网阶段的一种读取方式：单企业覆盖完成 ≠ 官网阶段完成 ≠ 整轮完成。
 - 阶段性导出允许随时进行，但 `discovery.completion.partial_export=true` 时，Excel 的"运行状态与完成度"表和命令行 `verdict` 都必须显式呈现未完成渠道与下一动作。

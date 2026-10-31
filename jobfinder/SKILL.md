@@ -3,7 +3,7 @@ name: jobfinder
 description: 检索中国大陆指定城市的岗位，复用企业官网、招聘站列表页直读与站内搜索、人才服务平台、本地宝网站及公众号等已实测渠道的方法，核验岗位原文、学历门槛与投递入口，维护企业资源库并导出Excel。支持新检索、刷新和公告反查企业；不自动投递。
 license: MIT
 metadata:
-  version: "0.5.0"
+  version: "0.5.1"
   compatibility: "Python 3.11+; file and terminal tools; host search/browser for live collection."
 ---
 
@@ -110,11 +110,18 @@ python -m jobfinder finalize --run <run_id>                         # 统一判�
 |---|---|
 | `open_auth_tab` | 该平台在业务搜索前必须先开页核验会话；打开 `login_url`，保留同一标签页 |
 | `wait_user_auth` | 已开页等用户登录；用户完成后用 `auth_probe` 提交核验，不要自填"已登录" |
-| `search_task` / `read_entry` | 执行该任务（查询词或官网入口读取），完成后提交 `search` 回执 |
+| `search_task` / `read_entry` | 执行该任务（查询词或官网入口读取），完成后提交 `search` 回执；**必须带 `exhausted`**（该页/该次检索是否已到底） |
+| `continue_channel` | 该渠道没搜到底而预算还有：用 `register_derived` 派生下一页/下一轮任务接着搜，或确认到底后补交 `exhausted=true` |
+| `register_derived` | 官网发现的企业线索没登记：把企业逐条登记成核实任务（或写 `company_waivers` 说明不可核实原因） |
 | `close_stage` | 当前阶段已无可执行任务，提交 `close-stage` 推进 |
 | `channel_blocked` | 该平台已记录受阻；按 `skip`/`blocked` 处置后继续其他渠道 |
 | `await_resolution` | 仍有未处置任务但无法继续，需重试、补证据或由用户明确跳过 |
 | `finalize` | 所有阶段处理完毕，进入整轮判定 |
+
+**渠道要跑到底，线索要逐家核实——这两条也是程序控制的**：
+- 任何 `direct/research/browse_list/channel_search` 回执缺少 `exhausted` 会被拒收；`exhausted=false` 且预算还有剩余时，`close-stage` 直接失败，`next-action` 只会给 `continue_channel`。
+- `direct/research` 任务报告发现 N 家企业，就必须登记 N 条核实任务（`derived`）或 N 条不可核实说明（`company_waivers`），否则拒收；官网阶段不核实完不许关。
+- 预算用尽才允许收工，且计为缺口（`PARTIAL`），不能算"跑完"。
 
 **阶段顺序是程序控制的**：当前阶段未关闭时，后一阶段的任务回执会被直接拒绝，并返回当前允许的动作。官网阶段发现的派生企业任务（`official-catalog` → `official-plan`、`extend-plan`、`follow-up-plan`）**并入官网阶段**，不能推到其他渠道之后再处理。
 

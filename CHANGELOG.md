@@ -1,5 +1,19 @@
 # 更新记录
 
+## 0.5.1
+
+执行协议升到 `workflow-1.1`：把"渠道要跑完"和"线索要逐家核实"从提示词变成拒绝入库的条件。
+
+真实跑一轮上海财务BP时暴露两个漏洞：官网阶段报"发现 3 家企业"却没有任何核实任务，渠道只读了第 1 页就当作跑完，整轮仍判 COMPLETE。现在补掉：
+
+- **`exhausted` 必填**：`route ∈ direct/research/browse_list/channel_search` 的 `search` 回执必须声明该检索是否已到底，缺了直接拒收（报错文案给出怎么继续）。
+- **没搜到底不许关阶段**：`exhausted=false` 且该城市预算仍有剩余时，`close-stage` 报错，`next-action` 只返回 `continue_channel`，附带 `budget_remaining`。要继续用新动作 `register_derived kind=page` 派生下一页任务，父任务把"到底"义务交给新页（`continued=true`），避免父任务永远挂着缺口。
+- **线索必须逐家核实**：`direct/research` 任务 `candidate_count > 已登记核实 + 书面豁免` 时拒收回执；`register_derived kind=company` 生成同阶段的 `official_verify` 任务；确实无法核实的要写 `company_waivers` 并给理由。官网阶段不核实完不许关。
+- **预算用尽才算收工**：关闭阶段时，未声明到底且预算耗尽的任务自动转 `budget_exhausted`，阶段 `closed_with_gaps`，整轮最高 `PARTIAL`，不会再被算成完整搜索。
+- **最终判定**：`channels[*].not_exhausted` 非零、或存在未核实线索、或存在升级前没标 `exhausted` 的检索，`COMPLETE` 一律降为 `PARTIAL` 并写明原因。
+- 兼容：旧协议回执（无 `exhausted`）仍可入库，但标 `legacy_exhaustion=true` 并在判定里降级，不迁移成"已通过新版检查"。
+- 测试：新增 6 个用例（缺 `exhausted` 拒收、未到底且预算未尽不许关阶段、派生页接管义务、预算耗尽记缺口、线索未登记拒收、派生核实任务卡住官网阶段），共 56 个用例全绿。
+
 ## 0.5.0
 
 运行控制器（协议 `workflow-1`）：把"渠道顺序 + 登录前置 + 完成判定"从提示词搬进程序。

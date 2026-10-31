@@ -139,3 +139,93 @@ class PersistAdvanceTest(unittest.TestCase):
         reloaded = workflow.load_state(ws, state['run_id'])
         self.assertEqual(reloaded['current_stage'], 'recruitment')
         self.assertEqual(reloaded['stages']['official']['status'], 'closed')
+
+
+class ExhaustionGateTest(unittest.TestCase):
+    """渠道必须跑到底、线索必须逐家核实——这两条由程序拦，不靠提示词。"""
+
+    def test_missing_exhausted_is_rejected(self):
+        ws = workspace()
+        state = workflow.start_run(make_config(channels=['51job']), make_plan(make_config(channels=['51job'])), ws)
+        task = tasks_of(state, channel='51job')[0]
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        with self.assertRaises(ValueError) as ctx:
+            workflow.record_action(state, {'action': 'search', 'task_id': task['task_id'],
+                                           'status': 'success',
+                                           'executed_at': '2026-10-31T15:00:00+08:00',
+                                           'candidate_count': 0}, ws)
+        self.assertIn('exhausted', str(ctx.exception))
+
+    def test_unexhausted_channel_with_budget_cannot_close_stage(self):
+        ws = workspace()
+        config = make_config(channels=['51job'], budget=5)
+        state = workflow.start_run(config, make_plan(config), ws)
+        task = tasks_of(state, channel='51job')[0]
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        search(ws, state, task['task_id'], exhausted=False)
+        action = workflow.next_action(state)
+        self.assertEqual(action['action'], 'continue_channel')
+        self.assertEqual(action['budget_remaining'], 4)
+        with self.assertRaises(ValueError) as ctx:
+            workflow.close_stage(state, 'recruitment')
+        self.assertIn('未声明检索到底', str(ctx.exception))
+
+    def test_page_derivation_takes_over_exhaustion_duty(self):
+        ws = workspace()
+        config = make_config(channels=['51job'], budget=5)
+        state = workflow.start_run(config, make_plan(config), ws)
+        first = tasks_of(state, channel='51job')[0]
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        search(ws, state, first['task_id'], exhausted=False)
+        workflow.record_action(state, {'action': 'register_derived', 'task_id': first['task_id'],
+                                       'kind': 'page', 'items': [{'url': 'https://x/p2/', 'page': 2}]}, ws)
+        self.assertTrue(first.get('continued'))
+        action = workflow.next_action(state)
+        self.assertEqual(action['action'], 'search_task')
+        self.assertEqual(action['task_id'], first['task_id'] + '-p1')
+        search(ws, state, action['task_id'], exhausted=True)
+        self.assertIn(workflow.next_action(state)['action'], ('close_stage', 'finalize', 'finished'))
+
+    def test_budget_exhausted_is_a_gap_not_complete(self):
+        ws = workspace()
+        config = make_config(channels=['51job'], budget=1)
+        state = workflow.start_run(config, make_plan(config), ws, user_confirmed_scope=True)
+        task = tasks_of(state, channel='51job')[0]
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        search(ws, state, task['task_id'], exhausted=False)
+        workflow.close_stage(state, 'recruitment')
+        self.assertEqual(task['status'], 'budget_exhausted')
+        self.assertEqual(state['stages']['recruitment']['status'], 'closed_with_gaps')
+
+    def test_discovery_leads_must_become_verify_tasks(self):
+        ws = workspace()
+        config = make_config(channels=['official_career'])
+        state = workflow.start_run(config, make_plan(config), ws)
+        research = next(t for t in state['tasks'] if t['route'] == 'research')
+        with self.assertRaises(ValueError) as ctx:
+            search(ws, state, research['task_id'], count=2)
+        self.assertIn('核实任务', str(ctx.exception))
+
+    def test_derived_verify_tasks_block_official_stage_until_done(self):
+        ws = workspace()
+        config = make_config(channels=['official_career'])
+        state = workflow.start_run(config, make_plan(config), ws)
+        direct = next(t for t in state['tasks'] if t['route'] == 'direct')
+        research = next(t for t in state['tasks'] if t['route'] == 'research')
+        search(ws, state, direct['task_id'], count=2,
+               derived=[{'company': '甲企业'}, {'company': '乙企业'}])
+        self.assertEqual(len(direct['derived_ids']), 2)
+        search(ws, state, research['task_id'], count=0)
+        action = workflow.next_action(state)
+        self.assertIn(action['action'], ('read_entry', 'search_task'))
+        self.assertEqual(action['task_id'], direct['derived_ids'][0])
+        self.assertEqual(action['stage'], 'official')
+        with self.assertRaises(ValueError):
+            workflow.close_stage(state, 'official')
+        for tid in direct['derived_ids']:
+            search(ws, state, tid, exhausted=None)
+        self.assertIn(workflow.next_action(state)['action'], ('close_stage', 'finalize', 'finished'))

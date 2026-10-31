@@ -80,12 +80,20 @@ def auth_probe(ws, state, channel, snapshot_text, *, context='ctx-1', tab='tab-1
         'snapshot_path': str(path)}, ws)
 
 
-def search(ws, state, task_id, status='success', executed_at=None, count=0):
+def search(ws, state, task_id, status='success', executed_at=None, count=0, *, exhausted=True,
+           derived=None, waivers=None):
+    """默认按"该检索已到底"提交；测管道未跑完时显式传 exhausted=False。"""
     from jobfinder import workflow
-    return workflow.record_action(state, {
-        'action': 'search', 'task_id': task_id, 'status': status,
-        'executed_at': executed_at or now(), 'search_tool': 'test-tool',
-        'candidate_count': count}, ws)
+    payload = {'action': 'search', 'task_id': task_id, 'status': status,
+               'executed_at': executed_at or now(), 'search_tool': 'test-tool',
+               'candidate_count': count}
+    if exhausted is not None:
+        payload['exhausted'] = exhausted
+    if derived:
+        payload['derived'] = derived
+    if waivers:
+        payload['company_waivers'] = waivers
+    return workflow.record_action(state, payload, ws)
 
 
 def open_auth(ws, state, channel, context='ctx-1', tab='tab-1'):
