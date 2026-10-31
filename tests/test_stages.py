@@ -333,3 +333,20 @@ class DeliveryGateTest(unittest.TestCase):
         comp = run_all_tasks(ws, state)
         self.assertTrue(comp['delivery_allowed'])
         self.assertEqual(comp['delivery_blockers'], [])
+
+
+class ChannelExhaustedTest(unittest.TestCase):
+    def test_one_page_declaring_end_closes_channel(self):
+        """翻到最后一页声明到底后，前面几页的 exhausted=false 不应继续报缺口。"""
+        ws = workspace()
+        config = make_config(channels=['51job'], budget=10)
+        state = workflow.start_run(config, make_plan(config), ws)
+        pages = tasks_of(state, channel='51job')
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        for t in pages[:-1]:
+            search(ws, state, t['task_id'], exhausted=False)
+        search(ws, state, pages[-1]['task_id'], exhausted=True)
+        self.assertEqual(workflow._incomplete_searches(state, 'recruitment'), [])
+        workflow.close_stage(state, 'recruitment')
+        self.assertIn(state['stages']['recruitment']['status'], ('closed', 'closed_with_gaps'))

@@ -406,10 +406,15 @@ def _incomplete_searches(state, stage):
     这些任务意味着渠道没跑完：既不能关阶段，也不能靠"任务 executed"混过去。
     """
     out = []
+    # 同一渠道只要有一条任务声明"检索到底"，就代表该渠道整体跑到尾了，
+    # 前面几页不用再各自声明（否则翻到最后一页也永远关不掉）。
+    done_channels = {t["channel"] for t in _stage_tasks(state, stage) if t.get("exhausted") is True}
     for task in _stage_tasks(state, stage):
         if task["status"] != "executed":
             continue
         if task["route"] not in EXHAUSTION_ROUTES:
+            continue
+        if task["channel"] in done_channels:
             continue
         if task.get("exhausted") is not False or task.get("continued"):
             continue
@@ -1022,7 +1027,8 @@ def finalize(state, *, persist=True, workspace=None):
         channel_rows.append({"channel": channel, "stage": channel_stage(channel), **counts,
                              "not_exhausted": sum(1 for t in tasks
                                                   if t.get("exhausted") is False and not t.get("continued")
-                                                  and t["status"] in ("executed", "budget_exhausted")),
+                                                  and t["status"] in ("executed", "budget_exhausted")
+                                                  and not any(x.get("exhausted") is True for x in tasks)),
                              "status": "not_covered" if counts["total"] == 0 else "recorded",
                              "auth_status": auth,
                              "auth_checked_at": (state.get("auth", {}).get(channel) or {}).get("checked_at"),
