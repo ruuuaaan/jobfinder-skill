@@ -48,6 +48,63 @@ PLATFORM_CHANNELS = ("zhaopin", "boss", "liepin", "51job", "linkedin")
 # 非检索类渠道：不进入阶段任务簿，只表示人工材料来源。
 NON_STAGE_CHANNELS = ("manual_import",)
 
+# 渠道菜单：技能实际支持的检索渠道及其能力差异。agent 必须把这张表呈现给用户选择，
+# 不能只按配置文件里的 sources 悄悄决定跑哪些渠道。
+CHANNEL_INFO = {
+    "official_career": {"label": "企业官网", "stage": "official",
+                        "note": "查询词/研究检索 → 企业名单 → 逐家官网核实；最慢但能拿 JD 原文"},
+    "51job": {"label": "前程无忧", "stage": "recruitment",
+              "note": "职能分类页直读为主，需登录核验"},
+    "zhaopin": {"label": "智联招聘", "stage": "recruitment",
+                "note": "站内搜索；未登录时薪资显示「-元」"},
+    "boss": {"label": "BOSS直聘", "stage": "recruitment",
+             "note": "核心无授权接口，只能由宿主可见浏览器读取"},
+    "liepin": {"label": "猎聘", "stage": "recruitment",
+               "note": "站内搜索/城市聚合页，需登录"},
+    "linkedin": {"label": "领英", "stage": "recruitment",
+                 "note": "未实测；需宿主显式授权后才能读取"},
+    "bendibao_web": {"label": "本地宝网站", "stage": "bendibao_web",
+                     "note": "偏国企/事业单位/基层岗位，需先确认站点入口"},
+    "bendibao_wechat": {"label": "本地宝公众号", "stage": "public_accounts",
+                        "note": "拿不到后台列表，只能检索可见内容，覆盖不完整"},
+}
+SUPPORTED_CHANNELS = ("official_career", "51job", "zhaopin", "boss", "liepin",
+                      "bendibao_web", "bendibao_wechat")
+
+
+def channel_menu(config=None):
+    """返回按阶段分组的渠道菜单，供 agent 原样展示给用户勾选。"""
+    configured = list(getattr(config, "sources", []) or []) if config is not None else []
+    rows = []
+    for stage in STAGES:
+        channels = [{"channel": c, "label": CHANNEL_INFO[c]["label"], "note": CHANNEL_INFO[c]["note"],
+                     "in_config": (c in configured) if configured else None}
+                    for c in SUPPORTED_CHANNELS if CHANNEL_INFO[c]["stage"] == stage]
+        if channels:
+            rows.append({"stage": stage, "label": STAGE_LABELS[stage], "channels": channels})
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "stage_order": list(STAGES),
+        "menu": rows,
+        "config_channels": configured,
+        "guidance": "必须先让用户勾选渠道，再把选中的 --channel 传给 start-run；"
+                    "不要依据配置文件静默决定范围。用户全选时可用 --all-channels。",
+    }
+
+
+def resolve_channel_selection(channels, all_channels=False):
+    """ CLI/客户端选择归一化：必须显式给出选择，不能为空。"""
+    if all_channels:
+        return list(SUPPORTED_CHANNELS), True
+    picked = list(dict.fromkeys(channels or []))
+    if not picked:
+        raise ValueError("必须显式选择渠道：请先展示渠道菜单，再把用户勾选结果传给 --channel（或 --all-channels）")
+    unknown = [c for c in picked if c not in CHANNEL_INFO]
+    if unknown:
+        raise ValueError("不支持的渠道：" + "、".join(unknown) +
+                         "；可选：" + "、".join(SUPPORTED_CHANNELS))
+    return picked, False
+
 TASK_TERMINAL = ("executed", "blocked", "skipped_by_user", "budget_exhausted")
 MAX_TASK_ATTEMPTS = 2
 
@@ -94,7 +151,8 @@ def state_file(workspace, run_id):
 # ---------------------------------------------------------------- 创建运行
 
 def start_run(config, plan, workspace, *, channels=None, public_only=False,
-              auth_policy=None, run_id=None, budget_used=None, previous_run=None):
+              auth_policy=None, run_id=None, budget_used=None, previous_run=None,
+              user_confirmed_scope=False):
     """冻结本轮执行范围并落盘。
 
     `channels` 必须是配置里的渠道子集；不传则取配置渠道。
@@ -150,6 +208,19 @@ def start_run(config, plan, workspace, *, channels=None, public_only=False,
         "previous_run": previous_run,
         "platform_auth_required": policy == "required",
     }
+    # 范围覆盖度：只覆盖部分阶段时，必须区分"用户明确只要这些"与"助手自行收窄"。
+    covered = set(state["scope"]["stage_order"])
+    missing = [s for s in STAGES if s not in covered]
+    state["scope"]["covered_stages"] = sorted(covered)
+    state["scope"]["missing_stages"] = missing
+    state["scope"]["user_scope_confirmed"] = bool(user_confirmed_scope)
+    if missing:
+        state["scope"]["coverage"] = "partial_scope"
+        state["scope_adjustments"].append({
+            "kind": "narrowed_scope", "missing_stages": missing,
+            "user_confirmed": bool(user_confirmed_scope), "at": now()})
+    else:
+        state["scope"]["coverage"] = "full_scope"
     state["updated_at"] = now()
     save_state(state, workspace)
     _append_event(state, {"kind": "start_run", "plan_id": state["plan_id"],
@@ -692,6 +763,17 @@ def finalize(state, *, persist=True, workspace=None):
     if uncovered and verdict == "COMPLETE":
         verdict = "PARTIAL"
         reasons.append("以下启用渠道没有任何任务与执行记录，不能计入完成：" + "、".join(uncovered))
+    scope = state.get("scope", {})
+    missing_stages = scope.get("missing_stages") or []
+    if missing_stages and verdict == "COMPLETE":
+        if scope.get("user_scope_confirmed"):
+            reasons.append("本轮为用户明确收窄的范围，未覆盖阶段：" +
+                           "、".join(STAGE_LABELS.get(x, x) for x in missing_stages))
+        else:
+            verdict = "PARTIAL"
+            reasons.append("本轮范围未经用户确认，只覆盖 " +
+                           "、".join(STAGE_LABELS.get(x, x) for x in state["scope"]["stage_order"] if x not in missing_stages) +
+                           "；未纳入：" + "、".join(STAGE_LABELS.get(x, x) for x in missing_stages))
     for row in stage_rows:
         if row["status"] not in ("closed", "closed_with_gaps", "closed_empty") and row["total"]:
             if verdict == "COMPLETE":

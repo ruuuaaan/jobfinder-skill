@@ -3,6 +3,7 @@ import unittest
 
 from support import make_config, make_plan
 
+from jobfinder import workflow
 from jobfinder.planning import BROWSE_CATALOG, browse_covered_pairs, browse_rows
 from jobfinder.workflow import channel_stage
 
@@ -48,3 +49,28 @@ class PlanChannelTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ChannelMenuTest(unittest.TestCase):
+    def test_menu_lists_every_supported_channel_by_stage(self):
+        menu = workflow.channel_menu(make_config(channels=['51job']))
+        flat = [c['channel'] for row in menu['menu'] for c in row['channels']]
+        self.assertEqual(flat, list(workflow.SUPPORTED_CHANNELS))
+        self.assertIn('boss', flat)
+        self.assertIn('liepin', flat)
+        self.assertEqual([row['stage'] for row in menu['menu']], list(workflow.STAGES))
+        in_config = {c['channel']: c['in_config'] for row in menu['menu'] for c in row['channels']}
+        self.assertTrue(in_config['51job'])
+        self.assertFalse(in_config['boss'])
+
+    def test_selection_must_be_explicit(self):
+        with self.assertRaises(ValueError):
+            workflow.resolve_channel_selection([], False)
+        with self.assertRaises(ValueError):
+            workflow.resolve_channel_selection(['nope'], False)
+        picked, all_flag = workflow.resolve_channel_selection(['51job', 'boss'], False)
+        self.assertEqual(picked, ['51job', 'boss'])
+        self.assertFalse(all_flag)
+        picked, all_flag = workflow.resolve_channel_selection(None, True)
+        self.assertEqual(tuple(picked), workflow.SUPPORTED_CHANNELS)
+        self.assertTrue(all_flag)

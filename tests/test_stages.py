@@ -104,3 +104,25 @@ class DerivedTaskTest(unittest.TestCase):
         platform_task = tasks_of(state, channel='51job')[0]
         with self.assertRaises(ValueError):
             search(ws, state, platform_task['task_id'])
+
+
+class ScopeConfirmationTest(unittest.TestCase):
+    def test_unconfirmed_narrow_scope_cannot_be_complete(self):
+        ws = workspace()
+        config = make_config(channels=['51job'])
+        plan = make_plan(config)
+        state = workflow.start_run(config, plan, ws)  # 未声明用户确认
+        completion = run_all_tasks(ws, state)
+        self.assertEqual(completion['verdict'], 'PARTIAL')
+        self.assertTrue(any('范围未经用户确认' in r for r in completion['reasons']))
+        self.assertEqual(state['scope']['missing_stages'],
+                         ['official', 'bendibao_web', 'public_accounts'])
+
+    def test_user_confirmed_narrow_scope_can_complete(self):
+        ws = workspace()
+        config = make_config(channels=['51job'])
+        plan = make_plan(config)
+        state = workflow.start_run(config, plan, ws, user_confirmed_scope=True)
+        completion = run_all_tasks(ws, state)
+        self.assertEqual(completion['verdict'], 'COMPLETE')
+        self.assertTrue(any('用户明确收窄' in r for r in completion['reasons']))

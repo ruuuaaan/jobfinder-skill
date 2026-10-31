@@ -56,10 +56,14 @@ def main():
     p=commands.add_parser("start-run",help="创建本轮运行并冻结渠道与阶段顺序")
     p.add_argument("--config",required=True)
     p.add_argument("--plan",required=True)
-    p.add_argument("--channel",action="append",help="用户明确只选的渠道，可重复；不传则取配置渠道")
+    p.add_argument("--channel",action="append",help="用户勾选的渠道，可重复；必须显式给出")
+    p.add_argument("--all-channels",action="store_true",help="用户选择全部支持的渠道")
     p.add_argument("--public-only",action="store_true",help="显式匿名读取模式（platform_auth_policy=public_only）")
+    p.add_argument("--user-confirmed",action="store_true",help="用户已明确只要当前渠道范围；未加时收窄范围不计为完成")
     p.add_argument("--run-id")
     p.add_argument("--output")
+    p=commands.add_parser("channels",help="输出渠道菜单，供用户勾选（新检索第一步）")
+    p.add_argument("--config"); p.add_argument("--output")
     p=commands.add_parser("next-action",help="返回当前唯一合法的下一动作")
     p.add_argument("--run"); p.add_argument("--output")
     p=commands.add_parser("record-action",help="提交实际执行回执（计划字段不可覆盖）")
@@ -129,8 +133,18 @@ def main():
                               'order':[c['legal_name'] for c in catalog['companies']],
                               'output':str(local_path(args.output))},ensure_ascii=False))
             return 0
-        if args.command in ('start-run','next-action','record-action','close-stage','finalize'):
+        if args.command in ('channels','start-run','next-action','record-action','close-stage','finalize'):
             from . import workflow
+            if args.command=='channels':
+                cfg=None
+                if args.config:
+                    from .spec import matching_config
+                    cfg=matching_config(json.loads(local_path(args.config).read_text(encoding='utf-8-sig')))
+                menu=workflow.channel_menu(cfg)
+                print(json.dumps(menu,ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),menu)
+                return 0
             if args.command=='start-run':
                 from .spec import matching_config
                 raw=json.loads(local_path(args.config).read_text(encoding='utf-8-sig'))
@@ -138,13 +152,28 @@ def main():
                 plan=json.loads(local_path(args.plan).read_text(encoding='utf-8-sig'))
                 if plan.get('config_fingerprint')!=fingerprint(config):
                     raise ValueError('计划与配置指纹不一致：请先用当前配置重新 plan')
-                state=workflow.start_run(config,plan,ROOT,channels=args.channel,
-                                         public_only=args.public_only,run_id=args.run_id)
+                picked,all_flag=workflow.resolve_channel_selection(args.channel,args.all_channels)
+                planned_channels={t['channel'] for t in plan.get('tasks',[])}|{t['channel'] for t in plan.get('entry_tasks',[])}
+                missing=[c for c in picked if c not in planned_channels]
+                if missing:
+                    raise ValueError('所选渠道在计划中没有任务：'+'、'.join(missing)+
+                        '；请用包含这些渠道的配置重新 plan（或用 channels 命令确认可选范围）')
+                state=workflow.start_run(config,plan,ROOT,channels=picked,
+                                         public_only=args.public_only,run_id=args.run_id,
+                                         user_confirmed_scope=True)
+                scope=state['scope']
                 result={'run_id':state['run_id'],'protocol_version':PROTOCOL_VERSION,
-                        'stage_order':state['scope']['stage_order'],'channels':state['scope']['channels'],
-                        'platform_auth_policy':state['scope']['platform_auth_policy'],
+                        'stage_order':scope['stage_order'],'channels':scope['channels'],
+                        'covered_stages':scope.get('covered_stages'),
+                        'missing_stages':scope.get('missing_stages'),
+                        'scope_confirmed':scope.get('user_scope_confirmed'),
+                        'platform_auth_policy':scope['platform_auth_policy'],
                         'tasks':len(state['tasks']),'state':str(workflow.state_file(ROOT,state['run_id'])),
                         'next':workflow.next_action(state)}
+                if scope.get('missing_stages'):
+                    result['scope_warning']=('本轮只覆盖 ' + '、'.join(scope['covered_stages']) +
+                        '，未纳入 ' + '、'.join(scope['missing_stages']) +
+                        ('（用户已确认）' if scope.get('user_scope_confirmed') else '（未经用户确认，最终不会判为完成；如确为需求请加 --user-confirmed）'))
                 print(json.dumps(result,ensure_ascii=False))
                 if args.output:
                     save_new_json(local_path(args.output),result)

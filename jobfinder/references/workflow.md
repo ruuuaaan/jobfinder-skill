@@ -39,7 +39,8 @@
 
 | 命令 | 作用 | 关键参数 |
 |---|---|---|
-| `start-run` | 冻结本轮范围、创建运行 | `--config --plan [--channel ...] [--public-only] [--run-id]` |
+| `channels` | 输出渠道菜单（型号、阶段、能力差异），供用户勾选 | `[--config] [--output]` |
+| `start-run` | 冻结本轮范围、创建运行 | `--config --plan (--channel ... 或 --all-channels) [--public-only] [--run-id]` |
 | `next-action` | 返回当前唯一合法的下一动作 | `--run` |
 | `record-action` | 提交实际执行回执 | `--run --input <JSON>` |
 | `close-stage` | 阶段内任务都有处置后关闭阶段 | `[--stage] --run` |
@@ -50,6 +51,8 @@
 ## 3. 阶段与任务状态
 
 - 全局顺序：`official → recruitment → bendibao_web → public_accounts`。用户明确只选部分渠道时按所选裁剪，不强行补回未选渠道。
+- **渠道必须由用户显式选择**：`start-run` 不接受"按配置默默决定"。缺 `--channel/--all-channels` 直接报错并列出可选渠道；选了计划里没有的渠道也报错。渠道清单以 `workflow.CHANNEL_INFO` 为准（官网、前程无忧、智联、BOSS、猎聘、领英、本地宝网站、本地宝公众号）。
+- 只覆盖部分阶段时，运行会记录 `scope.coverage=partial_scope`：用户确认过才可能判 `COMPLETE`，否则最高 `PARTIAL` 并写明未纳入哪些阶段。
 - 渠道映射：`official_career/public_recruitment → official`；`zhaopin/boss/liepin/51job/linkedin → recruitment`；`bendibao_web → bendibao_web`；`bendibao_wechat → public_accounts`；`manual_import` 不进入任务簿。
 - 任务状态：`pending`、`executed`、`failed`（可重试）、`blocked`、`skipped_by_user`、`budget_exhausted`。终止态只有后四个中的 `executed/blocked/skipped_by_user/budget_exhausted`。
 - 单任务最多尝试 2 次，之后转 `blocked`（原因附"重试耗尽"），阶段其余任务继续。

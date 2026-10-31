@@ -64,7 +64,7 @@ class ReceiptTest(unittest.TestCase):
     def test_full_execution_with_zero_results_can_complete(self):
         config = make_config(channels=['51job', 'bendibao_web'])
         plan = make_plan(config)
-        state = workflow.start_run(config, plan, self.ws)
+        state = workflow.start_run(config, plan, self.ws, user_confirmed_scope=True)
         completion = run_all_tasks(self.ws, state)
         self.assertEqual(completion['verdict'], 'COMPLETE')
         self.assertTrue(all(r['executed'] == r['total'] for r in completion['channels']))

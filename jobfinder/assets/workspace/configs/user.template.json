@@ -14,7 +14,12 @@
   "unknown_policy": "review",
   "sources": [
     "official_career",
-    "manual_import"
+    "51job",
+    "zhaopin",
+    "boss",
+    "liepin",
+    "bendibao_web",
+    "bendibao_wechat"
   ],
   "budget": {
     "requests": null,

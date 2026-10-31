@@ -38,8 +38,23 @@ class NewSearchIntegrationTest(unittest.TestCase):
         lines = [x for x in p.stdout.splitlines() if x.startswith('{')]
         return json.loads(lines[-1]) if lines else {}
 
+    def test_start_run_requires_explicit_channel_choice(self):
+        p = subprocess.run([sys.executable, str(RUN), '--workspace', str(self.ws), 'start-run',
+                            '--config', 'configs/int.json', '--plan', 'data/discovery/plan.json'],
+                           capture_output=True, text=True, encoding='utf-8', errors='replace')
+        self.assertEqual(p.returncode, 2)
+        self.assertIn('必须显式选择渠道', p.stderr)
+
+    def test_channel_menu_lists_all_supported_channels(self):
+        menu = self.cli('channels')
+        flat = [c['channel'] for row in menu['menu'] for c in row['channels']]
+        self.assertIn('boss', flat)
+        self.assertIn('liepin', flat)
+        self.assertIn('bendibao_wechat', flat)
+
     def test_new_search_reports_completion_and_keeps_ten_columns(self):
-        started = self.cli('start-run', '--config', 'configs/int.json', '--plan', 'data/discovery/plan.json')
+        started = self.cli('start-run', '--config', 'configs/int.json', '--plan', 'data/discovery/plan.json',
+                           '--channel', 'official_career')
         run_id = started['run_id']
         now = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec='seconds')
         tasks = self.plan['tasks']
