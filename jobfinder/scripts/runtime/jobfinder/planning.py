@@ -42,6 +42,9 @@ BROWSE_CATALOG = {
         'pages': 5,
         'categories': [
             (('薪酬',), 'xinzifulijingli', '薪酬福利经理'),
+            # 2026-10-31 实测：上海 jobs.51job.com/shanghai/caiwufenxijingli/ 标题为
+            # 「上海财务分析经理/主管招聘」，p1-p4 有卡片、p5 为空，含财务BP/Finance BP 原文。
+            (('财务BP',), 'caiwufenxijingli', '财务分析经理/主管'),
         ],
     },
     'liepin': {

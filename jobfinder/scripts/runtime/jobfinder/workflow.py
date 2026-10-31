@@ -269,20 +269,13 @@ def auth_status(state, channel):
     return "verified"
 
 
-def _platform_needing_auth(state):
+def _channel_needs_auth(state, channel):
+    """该渠道此刻是否需要先完成登录核验（只作用于任务自身的平台）。"""
+    if channel not in PLATFORM_CHANNELS:
+        return False
     if state.get("scope", {}).get("platform_auth_policy") == "public_only":
-        return None
-    stage = state["current_stage"]
-    channels = [c for c in state["scope"]["channels"]
-                if channel_stage(c) == stage and c in PLATFORM_CHANNELS]
-    for channel in channels:
-        # 该平台本轮已无待处置任务（受阻/用户跳过/预算耗尽）时，不再要求登录。
-        alive = [t for t in state["tasks"] if t["channel"] == channel and t["status"] not in TASK_TERMINAL]
-        if not alive:
-            continue
-        if auth_status(state, channel) != "verified":
-            return channel
-    return None
+        return False
+    return auth_status(state, channel) != "verified"
 
 
 def _platform_auth_blocked_by_policy(state, channel):
@@ -320,26 +313,26 @@ def next_action(state):
         _append_event(state, {"kind": "reopen_stage", "stage": target})
         stage = target
 
-    # 1. 招聘平台的登录前置优先于该平台的任何业务搜索。
-    pending_auth = _platform_needing_auth(state)
-    if pending_auth:
-        record = _auth_record(state, pending_auth) or {}
+    # 1. 当前阶段的可执行任务（含官网派生的企业核实任务）。
+    task = _next_task(state, stage)
+    # 2. 登录前置绑定到**具体任务所在平台**：一个平台未登录不应阻塞同阶段其他平台。
+    if task and _channel_needs_auth(state, task["channel"]):
+        channel = task["channel"]
+        record = _auth_record(state, channel) or {}
         if record.get("status") == "waiting_user":
             return {"action": "wait_user_auth", "run_id": state["run_id"], "stage": stage,
-                    "channel": pending_auth, "tab_id": record.get("tab_id"),
+                    "channel": channel, "task_id": task["task_id"], "tab_id": record.get("tab_id"),
                     "browser_context_id": record.get("browser_context_id"),
                     "login_url": record.get("login_url"),
                     "message": "已打开登录入口，等待用户在同一浏览器会话完成登录后提交核验"}
         if record.get("status") == "blocked":
             return {"action": "channel_blocked", "run_id": state["run_id"], "stage": stage,
-                    "channel": pending_auth, "reason": record.get("reason"),
+                    "channel": channel, "reason": record.get("reason"),
                     "message": "该平台登录受阻；记录原因后可跳过该平台，其余工作继续"}
         return {"action": "open_auth_tab", "run_id": state["run_id"], "stage": stage,
-                "channel": pending_auth, "login_url": login_url(pending_auth),
-                "message": "业务搜索前先打开该平台页面并核验当前会话；未登录则交给用户登录"}
+                "channel": channel, "task_id": task["task_id"], "login_url": login_url(channel),
+                "message": "该平台的业务搜索前先打开页面并核验当前会话；未登录则交给用户登录"}
 
-    # 2. 当前阶段的可执行任务（含官网派生的企业核实任务）。
-    task = _next_task(state, stage)
     if task:
         action = "read_entry" if task["route"] in ("enterprise", "entry_reuse", "announcement_reverse",
                                                    "enterprise_fallback") else "search_task"

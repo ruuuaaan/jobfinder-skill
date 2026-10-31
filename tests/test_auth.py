@@ -135,3 +135,21 @@ class BlockedPlatformTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PerTaskAuthTest(unittest.TestCase):
+    def test_unauthenticated_platform_does_not_block_other_platform(self):
+        ws = workspace()
+        config = make_config(channels=['51job', 'zhaopin'])
+        plan = make_plan(config)
+        state = workflow.start_run(config, plan, ws)
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        action = workflow.next_action(state)
+        # 51job 已核验，应当先执行 51job 的任务，而不是被未登录的智联挡住
+        self.assertEqual(action['action'], 'search_task')
+        self.assertEqual(action['channel'], '51job')
+        search(ws, state, action['task_id'])
+        action = workflow.next_action(state)
+        self.assertEqual(action['action'], 'open_auth_tab')
+        self.assertEqual(action['channel'], 'zhaopin')
