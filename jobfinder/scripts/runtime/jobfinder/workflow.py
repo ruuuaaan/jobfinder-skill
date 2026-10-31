@@ -415,6 +415,12 @@ def _incomplete_searches(state, stage):
             continue
         if budget_remaining(state, task.get("target_city")) == 0:
             continue
+        # 同渠道同阶段已经排着后续页/后续任务时，进度由那些任务承接，不重复要派生。
+        queued = [t for t in _stage_tasks(state, task["stage"])
+                  if t["task_id"] != task["task_id"] and t["channel"] == task["channel"]
+                  and t["status"] not in TASK_TERMINAL]
+        if queued:
+            continue
         out.append(task)
     return out
 

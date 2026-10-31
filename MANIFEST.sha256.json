@@ -76,7 +76,7 @@
   "jobfinder/scripts/runtime/jobfinder/spec.py": "5df40f200705057e14ec7890e2a8fa51a9126d23d5f01a50d7024cd00dead134",
   "jobfinder/scripts/runtime/jobfinder/statistics.py": "3a26ae84e0f8c5939becb853fe99b38acc862d4e10463aa737e4663eac8ead8d",
   "jobfinder/scripts/runtime/jobfinder/traversal.py": "7f30424c654b84ea8a0ea6deb8b4113baf75aea3fa4f4b9463f385b2f0ecd115",
-  "jobfinder/scripts/runtime/jobfinder/workflow.py": "a6c4f965ff8002a31c93229e63789024846d3d202be30522638c90ab68339c1d",
+  "jobfinder/scripts/runtime/jobfinder/workflow.py": "7aa420aab9600786f9d794c0672bf74982601903387fc68c8033e5e7e66262f6",
   "scripts/demo_workflow_trace.py": "787d2637bef789fc86682652ee0d71bc4d87ba3ebbf367edec1ef5b6f3b48aa4",
   "scripts/smoke_release.py": "d307879d6d1abd83641dac4fb62440edbda2436da2442ea66988727b00dca685",
   "scripts/update_manifest.py": "782bbbe4ce1e2254365f0629b31c9a68f2d9afd425da400a0571c821a90b5613",
@@ -86,5 +86,5 @@
   "tests/test_new_search_integration.py": "62fcc9ef5a63e122d9951b42fa645036ebe4236a9553ddcc32661fa9dcda4c63",
   "tests/test_planning.py": "b65c4bc77297226b35d28dc180a22f61b73fa4e9d5c7516baf8660e07b322a95",
   "tests/test_receipt.py": "9c5b9a8aa9b90ee602a1c6ff5ba7115b5b4bcb37f336525d3e87ee6c6a77f2a0",
-  "tests/test_stages.py": "f7b920a1bb52f77792f64d79662eef95e477748849443fe0551b66ecab8f681f"
+  "tests/test_stages.py": "88d135b915fba6ce836368f87ceb32829393c39216dce270548676e591f85ce0"
 }

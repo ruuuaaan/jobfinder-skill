@@ -229,3 +229,17 @@ class ExhaustionGateTest(unittest.TestCase):
         for tid in direct['derived_ids']:
             search(ws, state, tid, exhausted=None)
         self.assertIn(workflow.next_action(state)['action'], ('close_stage', 'finalize', 'finished'))
+
+
+class QueuedPageTest(unittest.TestCase):
+    def test_queued_task_satisfies_exhaustion_duty(self):
+        """同渠道还有排队任务时，不该因为当前任务没到底就去派生新任务。"""
+        ws = workspace()
+        config = make_config(channels=['official_career'], budget=5)
+        state = workflow.start_run(config, make_plan(config), ws)
+        direct = next(t for t in state['tasks'] if t['route'] == 'direct')
+        research = next(t for t in state['tasks'] if t['route'] == 'research')
+        search(ws, state, direct['task_id'], exhausted=False)
+        action = workflow.next_action(state)
+        self.assertEqual(action['action'], 'search_task')
+        self.assertEqual(action['task_id'], research['task_id'])
