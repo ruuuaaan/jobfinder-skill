@@ -340,6 +340,31 @@ def auth_status(state, channel):
     return "verified"
 
 
+def pending_auth_channels(state, stage=None):
+    """当前阶段里还缺登录核验的平台渠道。
+
+    进入招聘平台阶段时应**一次性**把这些平台的登录页都打开交给用户，
+    而不是执行一条任务弹一个，让用户反复切标签页。
+    """
+    stage = stage or state.get("current_stage")
+    out = []
+    for channel in state["scope"]["channels"]:
+        if channel_stage(channel) != stage or channel not in PLATFORM_CHANNELS:
+            continue
+        alive = [t for t in state["tasks"] if t["channel"] == channel and t["status"] not in TASK_TERMINAL]
+        if not alive:
+            continue
+        status = auth_status(state, channel)
+        if status == "verified":
+            continue
+        record = _auth_record(state, channel) or {}
+        out.append({"channel": channel, "label": CHANNEL_INFO.get(channel, {}).get("label", channel),
+                    "login_url": login_url(channel), "auth_status": status,
+                    "tab_id": record.get("tab_id"), "browser_context_id": record.get("browser_context_id"),
+                    "opened": status in ("waiting_user", "failed", "expired")})
+    return out
+
+
 def _channel_needs_auth(state, channel):
     """该渠道此刻是否需要先完成登录核验（只作用于任务自身的平台）。"""
     if channel not in PLATFORM_CHANNELS:

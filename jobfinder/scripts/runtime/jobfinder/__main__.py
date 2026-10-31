@@ -64,6 +64,8 @@ def main():
     p.add_argument("--output")
     p=commands.add_parser("channels",help="输出渠道菜单，供用户勾选（新检索第一步）")
     p.add_argument("--config"); p.add_argument("--output")
+    p=commands.add_parser("auth-tabs",help="列出本阶段还缺登录的平台，一次性打开交给用户")
+    p.add_argument("--run"); p.add_argument("--output")
     p=commands.add_parser("next-action",help="返回当前唯一合法的下一动作")
     p.add_argument("--run"); p.add_argument("--output")
     p=commands.add_parser("record-action",help="提交实际执行回执（计划字段不可覆盖）")
@@ -133,7 +135,7 @@ def main():
                               'order':[c['legal_name'] for c in catalog['companies']],
                               'output':str(local_path(args.output))},ensure_ascii=False))
             return 0
-        if args.command in ('channels','start-run','next-action','record-action','close-stage','finalize'):
+        if args.command in ('channels','start-run','auth-tabs','next-action','record-action','close-stage','finalize'):
             from . import workflow
             if args.command=='channels':
                 cfg=None
@@ -179,6 +181,16 @@ def main():
                     save_new_json(local_path(args.output),result)
                 return 0
             state=workflow.resolve_state(ROOT,args.run)
+            if args.command=='auth-tabs':
+                pending=workflow.pending_auth_channels(state)
+                result={'run_id':state['run_id'],'stage':state['current_stage'],
+                        'channels':pending,
+                        'message':('一次性打开这些登录页交给用户，全部登录完再逐个提交 auth_probe'
+                                   if pending else '本阶段没有待登录的平台')}
+                print(json.dumps(result,ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0
             if args.command=='next-action':
                 action=workflow.next_action(state)
                 workflow.save_state(state,ROOT)

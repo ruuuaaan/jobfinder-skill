@@ -153,3 +153,19 @@ class PerTaskAuthTest(unittest.TestCase):
         action = workflow.next_action(state)
         self.assertEqual(action['action'], 'open_auth_tab')
         self.assertEqual(action['channel'], 'zhaopin')
+
+
+class PendingAuthListTest(unittest.TestCase):
+    def test_lists_every_unverified_platform_at_once(self):
+        ws = workspace()
+        config = make_config(channels=['51job', 'zhaopin', 'boss', 'liepin'])
+        plan = make_plan(config)
+        state = workflow.start_run(config, plan, ws)
+        pending = workflow.pending_auth_channels(state)
+        self.assertEqual([x['channel'] for x in pending], ['51job', 'zhaopin', 'boss', 'liepin'])
+        self.assertTrue(all(x['login_url'] for x in pending))
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        pending = workflow.pending_auth_channels(state)
+        self.assertEqual([x['channel'] for x in pending], ['zhaopin', 'boss', 'liepin'])
+        self.assertEqual(pending[0]['auth_status'], 'missing')
