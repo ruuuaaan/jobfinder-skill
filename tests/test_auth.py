@@ -169,3 +169,22 @@ class PendingAuthListTest(unittest.TestCase):
         pending = workflow.pending_auth_channels(state)
         self.assertEqual([x['channel'] for x in pending], ['zhaopin', 'boss', 'liepin'])
         self.assertEqual(pending[0]['auth_status'], 'missing')
+
+
+class TaskLevelBlockedTest(unittest.TestCase):
+    def test_blocked_task_does_not_take_down_whole_channel(self):
+        ws = workspace()
+        config = make_config(channels=['official_career'])
+        state = workflow.start_run(config, make_plan(config), ws)
+        direct = next(t for t in state['tasks'] if t['route'] == 'direct')
+        research = next(t for t in state['tasks'] if t['route'] == 'research')
+        search(ws, state, direct['task_id'], count=2,
+               derived=[{'company': '甲企业'}, {'company': '乙企业'}])
+        kids = state['tasks'][-2:]
+        workflow.record_action(state, {'action': 'blocked', 'channel': 'official_career',
+                                       'task_id': kids[0]['task_id'],
+                                       'reason': '官网是 JS 空壳',
+                                       'evidence_ref': 'cap:1'}, ws)
+        self.assertEqual(kids[0]['status'], 'blocked')
+        self.assertEqual(kids[1]['status'], 'pending')
+        search(ws, state, research['task_id'], count=0)

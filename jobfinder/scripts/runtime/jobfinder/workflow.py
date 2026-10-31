@@ -850,7 +850,15 @@ def _record_blocked(state, payload, workspace):
     if not evidence:
         raise ValueError("受阻必须提供能力检测或访问失败证据（evidence_ref）")
     reason = payload.get("reason") or "受阻"
-    targets = [t for t in state["tasks"] if t["channel"] == channel and t["status"] not in TASK_TERMINAL]
+    task_id = payload.get("task_id")
+    if task_id:
+        # 单任务受阻：一家企业的官网读不到，不能把同渠道其他企业的核实任务一起打掉。
+        single = _find_task(state, task_id)
+        if single["status"] in TASK_TERMINAL:
+            raise ValueError("任务已处置，不能再记受阻：" + task_id)
+        targets = [single]
+    else:
+        targets = [t for t in state["tasks"] if t["channel"] == channel and t["status"] not in TASK_TERMINAL]
     for task in targets:
         task["status"] = "blocked"
         task["reason"] = reason
