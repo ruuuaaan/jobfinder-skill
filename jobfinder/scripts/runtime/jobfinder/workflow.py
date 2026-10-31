@@ -1114,8 +1114,15 @@ def finalize(state, *, persist=True, workspace=None):
         blockers.append(f"{len(unfinished)} 个任务未处置：" + "、".join(t["task_id"] for t in unfinished[:6]))
     if stages_open:
         blockers.append("阶段未收尾：" + "、".join(f"{r['label']}({r['status']})" for r in stages_open))
-    if not_exhausted:
-        blockers.append("渠道未搜到底：" + "、".join(r["channel"] for r in not_exhausted))
+    # 预算已经用尽时，"没到底"是如实的部分覆盖，不再是"还能继续却没做"的阻塞项。
+    cities = state["scope"].get("cities") or [None]
+    budget_left = min([x for x in (budget_remaining(state, c) for c in cities) if x is not None],
+                      default=None)
+    if not_exhausted and (budget_left is None or budget_left > 0):
+        blockers.append("渠道未搜到底（预算仍有 %s 次）：%s" % (budget_left, "、".join(r["channel"] for r in not_exhausted)))
+    elif not_exhausted:
+        reasons.append("预算已用尽，以下渠道未搜到底，按部分覆盖交付：" +
+                       "、".join(r["channel"] for r in not_exhausted))
     delivery_allowed = not blockers and verdict in ("COMPLETE", "PARTIAL")
     completion = {
         "run_id": state["run_id"],
