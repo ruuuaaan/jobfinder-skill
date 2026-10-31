@@ -37,6 +37,8 @@ def main():
         'candidate_education': None,
     }
     (WS / 'configs/trace.json').write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+    (WS / 'data' / 'discovery').mkdir(parents=True, exist_ok=True)
+    (WS / 'data' / 'discovery' / 'trace-plan.json').unlink(missing_ok=True)
     cli('plan', '--config', 'configs/trace.json', '--output', 'data/discovery/trace-plan.json')
 
     # ---- 轨迹 A：四阶段正常执行
@@ -147,7 +149,7 @@ def main():
                     'unfinished': completion_b['unfinished'],
                     'reasons': completion_b['reasons']},
     }
-    out = Path('trace-summary.json')
+    out = WS / 'trace-summary.json'
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
