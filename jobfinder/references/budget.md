@@ -6,7 +6,21 @@ Skill/CLI 的旧共享模式基础默认是每城 40 次实际搜索；网页版
 
 新网页任务显式保存 `budget_policy=official_priority_once`。分配公式唯一来源是 `jobfinder/search_budget.py`；保存到 `effective_search_spec.search_budget.allocation_policy` 及 `per_city_channel`。每城已选的非官网渠道默认各分配 **5 次**（`BASE_OTHER`），也可在 `search_budget.per_channel` 里逐渠道显式指定额度；官网永远取剩余（城市总预算 − 其它渠道合计），**不接受单独指定官网额度**。没有启用官网时，剩余保留为未分配，不擅自开启渠道；基础预算不足各渠道额度合计时要求提高预算或减少渠道，不静默增加基础总额。
 
-换算示例：7 个渠道（官网 + 猎聘/BOSS/智联/前程无忧/本地宝网站/本地宝公众号）、每城 60 次、非官网各 5 次 → 其它渠道合计 30，官网得 30。若仍用每城 40，则官网只剩 10，必须先提高城市总预算。
+换算示例：8 个渠道（官网 + 猎聘/BOSS/智联/前程无忧/高校就业网/本地宝网站/本地宝公众号）、每城 60 次、非官网各 5 次 → 其它渠道合计 35，官网得 25。若仍用每城 40，则官网只剩 5，必须先提高城市总预算。
+
+### 控制器侧的 `budget.per_channel`（与上面不同）
+
+网页版是"官网取剩余"的分配法；**核心控制器的 `budget.per_channel` 是各渠道独立定额、互不侵占**：
+
+```json
+"budget": {"searches_per_city": 45,
+           "per_channel": {"official_career": 10, "51job": 5, "zhaopin": 5, "boss": 5,
+                           "liepin": 5, "campus_job": 5, "bendibao_web": 5, "bendibao_wechat": 5}}
+```
+
+- 某渠道配额用完 → 该渠道 `record-action` 被拒收，剩余任务在 `close-stage` 时转 `budget_exhausted`（计缺口，不影响其他渠道）。
+- `searches_per_city` 在分渠道模式下不再限制总量，建议填成各配额之和，仅作展示与旧逻辑兜底。
+- 阶段配额 `by_stage` 仍单独记，官网核实任务按官网阶段账判断（见 0.5.3）。
 
 每城每个非官网渠道在首次**搜索尝试失败**时额外授予1次；不从官网扣除，不退款原失败消耗，后续失败不再授予。官网失败、搜索成功但零结果、网页读取/模型提取失败不触发。补充事件保存在 `channel_budget_grants`，记录城市、渠道、查询、尝试序号、失败类型和时间；暂停、恢复、手动重试、更改基础上限都不清零。补额度不解除服务不可用或验证限制。
 

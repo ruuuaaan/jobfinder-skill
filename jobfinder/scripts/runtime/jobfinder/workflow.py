@@ -25,10 +25,11 @@ PROTOCOL_VERSION = "workflow-1.1"
 
 # 全局阶段顺序：官网 → 招聘平台 → 本地宝网站 → 公众号。
 # 同一阶段内可以按预算轮转城市/平台/任务；跨阶段不得抢跑。
-STAGES = ("official", "recruitment", "bendibao_web", "public_accounts")
+STAGES = ("official", "recruitment", "campus", "bendibao_web", "public_accounts")
 STAGE_LABELS = {
     "official": "企业官网",
     "recruitment": "招聘平台",
+    "campus": "高校就业网",
     "bendibao_web": "本地宝网站",
     "public_accounts": "公众号",
 }
@@ -40,6 +41,7 @@ CHANNEL_STAGE = {
     "liepin": "recruitment",
     "51job": "recruitment",
     "linkedin": "recruitment",
+    "campus_job": "campus",
     "bendibao_web": "bendibao_web",
     "bendibao_wechat": "public_accounts",
 }
@@ -72,11 +74,15 @@ CHANNEL_INFO = {
                  "note": "未实测；需宿主显式授权后才能读取"},
     "bendibao_web": {"label": "本地宝网站", "stage": "bendibao_web",
                      "note": "偏国企/事业单位/基层岗位，需先确认站点入口"},
+    "campus_job": {"label": "高校就业网", "stage": "campus",
+                   "note": "学校就业网/学生就业创业服务网，校招与应届岗为主；需逐校站内检索"},
+    "bendibao_web": {"label": "本地宝网站", "stage": "bendibao_web",
+                     "note": "偏国企/事业单位/基层岗位，需先确认站点入口"},
     "bendibao_wechat": {"label": "本地宝公众号", "stage": "public_accounts",
                         "note": "拿不到后台列表，只能检索可见内容，覆盖不完整"},
 }
 SUPPORTED_CHANNELS = ("official_career", "51job", "zhaopin", "boss", "liepin",
-                      "bendibao_web", "bendibao_wechat")
+                      "campus_job", "bendibao_web", "bendibao_wechat")
 
 
 def channel_menu(config=None):
@@ -218,7 +224,8 @@ def start_run(config, plan, workspace, *, channels=None, public_only=False,
     # 预算上限冻结进运行状态：后续判断"还能不能继续搜"只认这里的值。
     plan_budget = (plan.get("effective_config") or {}).get("budget") or {}
     state["scope"]["budget"] = {"searches_per_city": plan_budget.get("searches_per_city"),
-                                "companies_per_city": plan_budget.get("companies_per_city")}
+                                "companies_per_city": plan_budget.get("companies_per_city"),
+                                "per_channel": dict(plan_budget.get("per_channel") or {})}
     # 范围覆盖度：只覆盖部分阶段时，必须区分"用户明确只要这些"与"助手自行收窄"。
     covered = set(state["scope"]["stage_order"])
     missing = [s for s in STAGES if s not in covered]
@@ -391,8 +398,38 @@ def _platform_auth_blocked_by_policy(state, channel):
 
 # ---------------------------------------------------------------- 下一动作
 
+def channel_budget_cap(state, channel):
+    """该渠道本轮配额；没配 per_channel 时退回城市单池上限。"""
+    budget = state.get("scope", {}).get("budget") or {}
+    per_channel = budget.get("per_channel") or {}
+    if channel in per_channel:
+        return int(per_channel[channel])
+    return budget.get("searches_per_city")
+
+
+def channel_budget_used(state, channel, city):
+    used = (state.get("budget_used") or {}).get("by_channel", {}).get(channel, {}) or {}
+    return int(used.get(city, 0))
+
+
+def channel_budget_remaining(state, channel, city):
+    cap = channel_budget_cap(state, channel)
+    if cap is None:
+        return None
+    return max(0, cap - channel_budget_used(state, channel, city))
+
+
 def budget_remaining(state, city):
-    """该城市还能搜几次；None 表示计划未设上限。"""
+    """全轮还能搜几次；None 表示计划未设上限。
+
+    配了 per_channel 时返回各渠道剩余额度之和：渠道之间各花各的，不再互相抢。
+    """
+    per_channel = (state.get("scope", {}).get("budget") or {}).get("per_channel") or {}
+    if per_channel:
+        total = 0
+        for channel, cap in per_channel.items():
+            total += max(0, int(cap) - channel_budget_used(state, channel, city))
+        return total
     cap = (state.get("scope", {}).get("budget") or {}).get("searches_per_city")
     if cap is None:
         return None
@@ -418,7 +455,7 @@ def _incomplete_searches(state, stage):
             continue
         if task.get("exhausted") is not False or task.get("continued"):
             continue
-        if budget_remaining(state, task.get("target_city")) == 0:
+        if channel_budget_remaining(state, task["channel"], task.get("target_city")) == 0:
             continue
         # 同渠道同阶段已经排着后续页/后续任务时，进度由那些任务承接，不重复要派生。
         queued = [t for t in _stage_tasks(state, task["stage"])
@@ -548,8 +585,12 @@ def _next_task(state, stage):
         if task["stage"] != stage:
             continue
         if task["status"] in ("pending", "failed"):
-            if task["attempts"] < MAX_TASK_ATTEMPTS:
-                return task
+            if task["attempts"] >= MAX_TASK_ATTEMPTS:
+                continue
+            # 该渠道配额已用完：不再派活，交给 close_stage 记成 budget_exhausted。
+            if channel_budget_remaining(state, task["channel"], task.get("target_city")) == 0:
+                continue
+            return task
     return None
 
 
@@ -647,6 +688,15 @@ def _normalize_identified(identified):
 def _record_search(state, payload, workspace):
     task = _find_task(state, payload.get("task_id"))
     _assert_current_stage(state, task)
+    # 分渠道配额：本渠道额度用完就拒收，不再靠总池"先到先得"挤占别的渠道。
+    cap = channel_budget_cap(state, task["channel"])
+    if cap is not None:
+        used = channel_budget_used(state, task["channel"], task.get("target_city"))
+        if used >= cap:
+            raise ValueError(
+                f"渠道 {task['channel']} 本轮预算已用完（配额 {cap} 次，已用 {used} 次）。"
+                f"请改用该渠道已有的读取结果，或记 blocked/skipped_by_user 说明未覆盖部分；"
+                f"要追加额度请在新一轮 start-run 里提高 budget.per_channel")
     _assert_auth(state, task["channel"])
     for field in payload:
         if field in PLAN_FIELDS and payload[field] != task.get(field):
@@ -750,6 +800,8 @@ def _track_budget(state, task):
     # 分阶段账：官网核实要一直做到"官网预算用完"，不能靠总账里别的渠道额度续命。
     by_stage = state["budget_used"].setdefault("by_stage", {}).setdefault(task["stage"], {})
     by_stage[city] = by_stage.get(city, 0) + 1
+    by_channel = state["budget_used"].setdefault("by_channel", {}).setdefault(task["channel"], {})
+    by_channel[city] = by_channel.get(city, 0) + 1
 
 
 def stage_budget_remaining(state, stage, city):
@@ -957,20 +1009,29 @@ def _public_task(task):
 
 def close_stage(state, stage, *, persist=True, workspace=None):
     tasks = _stage_tasks(state, stage)
-    # 官网核实任务：预算用尽就不许再挂着，如实转 budget_exhausted（计为缺口，不是"已完成"）。
+    # 还没派出去的任务，若所属渠道配额已用完，就不能再挂着：如实转 budget_exhausted
+    # （计为缺口，不是"已完成"）。官网核实任务另按官网阶段账判断。
     for task in tasks:
-        if task["status"] in ("pending", "failed") and task["route"] == VERIFY_ROUTE \
-                and stage_budget_remaining(state, stage, task.get("target_city")) == 0:
+        if task["status"] not in ("pending", "failed"):
+            continue
+        if task["route"] == VERIFY_ROUTE:
+            if stage_budget_remaining(state, stage, task.get("target_city")) == 0:
+                task["status"] = "budget_exhausted"
+                task["reason"] = "官网搜索预算已用尽，该企业未完成核实"
+            continue
+        if channel_budget_remaining(state, task["channel"], task.get("target_city")) == 0:
             task["status"] = "budget_exhausted"
-            task["reason"] = "官网搜索预算已用尽，该企业未完成核实"
+            task["reason"] = (f"{CHANNEL_INFO.get(task['channel'], {}).get('label', task['channel'])}"
+                              f"本轮渠道配额已用尽，该任务未执行")
     unhandled = [t["task_id"] for t in tasks if t["status"] not in TASK_TERMINAL]
     if unhandled:
         raise ValueError("阶段尚未结束：未处置任务 " + "、".join(unhandled))
     # 预算还有却没声明搜到底 → 不许关阶段，先把该渠道跑干净。
     open_work = _incomplete_searches(state, stage)
     if open_work:
-        names = "、".join(f"{t['task_id']}({t['channel']}, 余 {budget_remaining(state, t.get('target_city'))} 次)"
-                         for t in open_work)
+        names = "、".join(
+            f"{t['task_id']}({t['channel']}, 余 {channel_budget_remaining(state, t['channel'], t.get('target_city'))} 次)"
+            for t in open_work)
         raise ValueError("阶段不能关闭：以下渠道未声明检索到底且预算仍有剩余 —— " + names +
                          "；请用 register_derived 派生下一页/下一轮任务继续检索，或补交 exhausted=true 说明已到底")
     # 预算已经用尽的未完成检索，如实记成 budget_exhausted（这是可接受的收尾，但会算成缺口）。
@@ -980,9 +1041,9 @@ def close_stage(state, stage, *, persist=True, workspace=None):
         if task["channel"] in finished_channels:
             continue
         if task["status"] == "executed" and task["route"] in EXHAUSTION_ROUTES and task.get("exhausted") is False \
-                and budget_remaining(state, task.get("target_city")) == 0:
+                and channel_budget_remaining(state, task["channel"], task.get("target_city")) == 0:
             task["status"] = "budget_exhausted"
-            task["reason"] = "搜索预算已用尽，检索未到底"
+            task["reason"] = "该渠道配额已用尽，检索未到底"
     # 官网发现的企业线索没转成核实任务 → 不许关阶段。
     gaps = derived_gaps(state, stage)
     if gaps:
@@ -1036,6 +1097,9 @@ def finalize(state, *, persist=True, workspace=None):
         auth = auth_status(state, channel) if channel in PLATFORM_CHANNELS else "not_required"
         reasons = sorted({t.get("reason") for t in tasks if t.get("reason")})
         channel_rows.append({"channel": channel, "stage": channel_stage(channel), **counts,
+                             "budget_cap": channel_budget_cap(state, channel),
+                             "budget_used": channel_budget_used(
+                                 state, channel, (state["scope"].get("cities") or [None])[0]),
                              "not_exhausted": sum(1 for t in tasks
                                                   if t.get("exhausted") is False and not t.get("continued")
                                                   and t["status"] in ("executed", "budget_exhausted")

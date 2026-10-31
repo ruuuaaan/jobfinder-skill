@@ -14,9 +14,9 @@ class StageOrderTest(unittest.TestCase):
         self.plan = make_plan(self.config)
         self.state = workflow.start_run(self.config, self.plan, self.ws)
 
-    def test_default_order_is_four_stages(self):
+    def test_default_order_is_all_stages(self):
         self.assertEqual(self.state['scope']['stage_order'],
-                         ['official', 'recruitment', 'bendibao_web', 'public_accounts'])
+                         ['official', 'recruitment', 'campus', 'bendibao_web', 'public_accounts'])
         self.assertEqual(self.state['current_stage'], 'official')
 
     def test_recruitment_search_before_official_is_rejected(self):
@@ -41,7 +41,7 @@ class StageOrderTest(unittest.TestCase):
         completion = run_all_tasks(self.ws, self.state)
         self.assertEqual(completion['verdict'], 'COMPLETE')
         self.assertEqual([s['stage'] for s in completion['stages']],
-                         ['official', 'recruitment', 'bendibao_web', 'public_accounts'])
+                         ['official', 'recruitment', 'campus', 'bendibao_web', 'public_accounts'])
 
     def test_bendibao_web_does_not_replace_public_accounts(self):
         config = make_config(channels=['bendibao_web', 'bendibao_wechat'])
@@ -64,7 +64,7 @@ class StageOrderTest(unittest.TestCase):
         completion = workflow.completion_with_channels(completion, config, [])
         self.assertEqual(completion['verdict'], 'PARTIAL')
         missing = {r['channel'] for r in completion['channels'] if r.get('status') == 'not_covered'}
-        self.assertEqual(missing, {'official_career', 'bendibao_web', 'bendibao_wechat'})
+        self.assertEqual(missing, {'official_career', 'campus_job', 'bendibao_web', 'bendibao_wechat'})
 
 
 class ChannelScopeTest(unittest.TestCase):
@@ -116,7 +116,7 @@ class ScopeConfirmationTest(unittest.TestCase):
         self.assertEqual(completion['verdict'], 'PARTIAL')
         self.assertTrue(any('范围未经用户确认' in r for r in completion['reasons']))
         self.assertEqual(state['scope']['missing_stages'],
-                         ['official', 'bendibao_web', 'public_accounts'])
+                         ['official', 'campus', 'bendibao_web', 'public_accounts'])
 
     def test_user_confirmed_narrow_scope_can_complete(self):
         ws = workspace()
@@ -350,3 +350,100 @@ class ChannelExhaustedTest(unittest.TestCase):
         self.assertEqual(workflow._incomplete_searches(state, 'recruitment'), [])
         workflow.close_stage(state, 'recruitment')
         self.assertIn(state['stages']['recruitment']['status'], ('closed', 'closed_with_gaps'))
+
+
+class ChannelBudgetTest(unittest.TestCase):
+    """分渠道配额：官网 10 次、其余各 5 次，渠道之间不再互相抢额度。"""
+
+    QUOTA = {'official_career': 10, '51job': 5, 'zhaopin': 5, 'boss': 5, 'liepin': 5,
+             'campus_job': 5, 'bendibao_web': 5, 'bendibao_wechat': 5}
+
+    def test_default_template_quota_shape(self):
+        """模板默认值就是用户要的：官网 10、其他各 5。"""
+        import json
+        from pathlib import Path as _P
+        tpl = json.loads((_P(__file__).resolve().parents[1] /
+                          'jobfinder/assets/workspace/configs/user.template.json').read_text(encoding='utf-8'))
+        per = tpl['budget']['per_channel']
+        self.assertEqual(per['official_career'], 10)
+        for ch in ('51job', 'zhaopin', 'boss', 'liepin', 'campus_job', 'bendibao_web', 'bendibao_wechat'):
+            self.assertEqual(per[ch], 5, ch)
+        self.assertEqual(tpl['budget']['searches_per_city'], sum(per.values()))
+
+    def test_each_channel_has_its_own_counter(self):
+        ws = workspace()
+        config = make_config(channels=['51job', 'zhaopin'], per_channel=self.QUOTA)
+        state = workflow.start_run(config, make_plan(config), ws)
+        self.assertEqual(workflow.channel_budget_cap(state, '51job'), 5)
+        self.assertEqual(workflow.channel_budget_cap(state, 'official_career'), 10)
+        task = tasks_of(state, channel='51job')[0]
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        search(ws, state, task['task_id'], exhausted=False)
+        # 51job 用掉 1 次，不影响智联的额度
+        self.assertEqual(workflow.channel_budget_remaining(state, '51job', '北京'), 4)
+        self.assertEqual(workflow.channel_budget_remaining(state, 'zhaopin', '北京'), 5)
+
+    def test_over_quota_is_rejected(self):
+        ws = workspace()
+        config = make_config(channels=['51job'], per_channel={'51job': 1})
+        state = workflow.start_run(config, make_plan(config), ws)
+        task = tasks_of(state, channel='51job')[0]
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        search(ws, state, task['task_id'], exhausted=False)
+        with self.assertRaises(ValueError) as ctx:
+            search(ws, state, task['task_id'], exhausted=False)
+        self.assertIn('预算已用完', str(ctx.exception))
+        self.assertIn('配额 1 次', str(ctx.exception))
+
+    def test_pending_tasks_of_exhausted_channel_become_budget_exhausted(self):
+        ws = workspace()
+        config = make_config(channels=['51job'], per_channel={'51job': 1})
+        state = workflow.start_run(config, make_plan(config), ws)
+        tasks = tasks_of(state, channel='51job')
+        open_auth(ws, state, '51job')
+        auth_probe(ws, state, '51job', LOGGED_IN_51JOB)
+        search(ws, state, tasks[0]['task_id'], exhausted=True)
+        # 配额用完，剩下的页不再派活（单阶段跑完会直接给 finished）
+        self.assertIn(workflow.next_action(state)['action'], ('close_stage', 'finalize', 'finished'))
+        workflow.close_stage(state, 'recruitment')
+        rest = tasks[1:]
+        if rest:
+            self.assertTrue(all(t['status'] == 'budget_exhausted' for t in rest))
+
+    def test_legacy_single_pool_still_works(self):
+        """没配 per_channel 的旧配置退回单池预算，行为不变。"""
+        ws = workspace()
+        config = make_config(channels=['51job'], budget=3)
+        state = workflow.start_run(config, make_plan(config), ws)
+        self.assertEqual(workflow.channel_budget_cap(state, '51job'), 3)
+        self.assertEqual(workflow.budget_remaining(state, '北京'), 3)
+
+
+class CampusChannelTest(unittest.TestCase):
+    def test_campus_is_its_own_stage_after_recruitment(self):
+        menu = workflow.channel_menu(make_config(channels=['campus_job']))
+        stages = [row['stage'] for row in menu['menu']]
+        self.assertIn('campus', stages)
+        self.assertLess(stages.index('recruitment'), stages.index('campus'))
+        self.assertLess(stages.index('campus'), stages.index('bendibao_web'))
+        row = next(r for r in menu['menu'] if r['stage'] == 'campus')
+        self.assertEqual([c['channel'] for c in row['channels']], ['campus_job'])
+
+    def test_campus_channel_generates_plan_task(self):
+        config = make_config(channels=['official_career', 'campus_job'])
+        plan = make_plan(config)
+        campus = [t for t in plan['tasks'] if t['channel'] == 'campus_job']
+        self.assertTrue(campus)
+        self.assertTrue(all(t['stage'] == 'campus' for t in campus))
+        self.assertIn('高校就业网', campus[0]['query'])
+
+    def test_recruitment_cannot_jump_over_campus(self):
+        ws = workspace()
+        config = make_config(channels=['51job', 'campus_job'])
+        state = workflow.start_run(config, make_plan(config), ws)
+        campus_task = tasks_of(state, channel='campus_job')[0]
+        with self.assertRaises(ValueError) as ctx:
+            search(ws, state, campus_task['task_id'])
+        self.assertIn('跨阶段抢跑被拒绝', str(ctx.exception))

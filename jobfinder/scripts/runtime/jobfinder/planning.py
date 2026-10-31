@@ -22,6 +22,7 @@ CHANNEL_METHODS = {
     'liepin': ('猎聘', '站内搜索'),
     '51job': ('前程无忧', '站内搜索'),
     'linkedin': ('领英', '站内检索'),
+    'campus_job': ('高校就业网', '站内检索'),
     'bendibao_web': ('本地宝网站', '站内检索'),
     'bendibao_wechat': ('本地宝公众号', '公众号检索'),
 }
@@ -243,7 +244,7 @@ def build_plan(config, catalog=None, *, role_groups=None, company_assessments=No
         row["routes"][task["route"]] = row["routes"].get(task["route"], 0) + 1
         if task["status"] in ("planned", "budget_exhausted"):
             row[task["status"]] += 1
-    stage_order = [s for s in ("official", "recruitment", "bendibao_web", "public_accounts")
+    stage_order = [s for s in ("official", "recruitment", "campus", "bendibao_web", "public_accounts")
                    if any(t.get("stage") == s for t in tasks) or
                    (s == "official" and config.sources and OFFICIAL in config.sources)]
     return dict(plan_id=str(uuid.uuid4()), created_at=now(), config_fingerprint=fingerprint(config),

@@ -1,5 +1,19 @@
 # 更新记录
 
+## 0.5.4
+
+两个需求：**预算改成按渠道配额**、**新增高校就业网渠道**。
+
+- **`budget.per_channel`（分渠道配额）**：`{"official_career": 10, "51job": 5, ..., "campus_job": 5}`，模板默认官网 10 次、其余渠道各 5 次（合计 45）。渠道之间各花各的额度，不再因阶段顺序先到先得而挤占。
+  - 某渠道配额用完 → 该渠道 `record-action` 直接拒收（报错写明配额与已用次数）；剩余任务在 `close-stage` 时转 `budget_exhausted`，计缺口但**不影响其他渠道**。
+  - `budget_used` 记三本账：`searches`（城市总）、`by_stage`（阶段）、`by_channel`（渠道）。
+  - 未配 `per_channel` 的旧配置自动退回单池模式（`searches_per_city` 全渠道共享），行为不变。
+- **新增渠道 `campus_job`（高校就业网）与独立阶段 `campus`**：阶段顺序变为 `official → recruitment → campus → bendibao_web → public_accounts`。菜单里单独一栏，默认 5 次配额。
+  - 新增 `references/campus.md`：三层入口（国家级 `ncss.cn` / 省级 `firstjob.shec.edu.cn` / 各校站）、才立方系统 URL 规律（`*.91wllm.cn/job/view/id/<id>/...`，详情页可静态读）、跨校重复转载必须按「公司＋岗位＋地点」去重、发布方≠雇主、校招岗不得替用户假设应届资格。
+  - 实测记录：`ncss.cn` 列表可静态读、搜索是前端 AJAX（`?keyword=` 无效）；`firstjob.shec.edu.cn` 首页 JS 渲染须浏览器；同一岗位（南孚「财务管理培训生(财务BP)」）在三个学校就业网重复出现。
+- 兼容：旧运行状态的 `stage_order` 已冻结，不受新阶段影响；旧配置无 `per_channel` 照旧跑。
+- 测试：新增 8 个用例（模板配额形状、渠道独立计数、超配额拒收、配额耗尽的剩余任务转缺口、旧单池兼容、campus 阶段位置、campus 任务生成、招聘阶段不能跳过 campus），共 **73 个用例**。
+
 ## 0.5.3
 
 - **有官网链接必须核实**：`identified` 支持 `{company,url}`；带 url 的企业不能进 `company_waivers`（拒收），只能逐家核实。

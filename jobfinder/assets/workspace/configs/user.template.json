@@ -18,12 +18,23 @@
     "zhaopin",
     "boss",
     "liepin",
+    "campus_job",
     "bendibao_web",
     "bendibao_wechat"
   ],
   "budget": {
     "requests": null,
-    "searches_per_city": 40,
+    "searches_per_city": 45,
+    "per_channel": {
+      "official_career": 10,
+      "51job": 5,
+      "zhaopin": 5,
+      "boss": 5,
+      "liepin": 5,
+      "campus_job": 5,
+      "bendibao_web": 5,
+      "bendibao_wechat": 5
+    },
     "companies_per_city": null,
     "timeout": 12,
     "retries": 0,

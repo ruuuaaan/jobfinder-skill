@@ -1,12 +1,12 @@
 {
-  "file_count": 89,
+  "file_count": 90,
   "allowlist_only": true,
   "no_git_history": true,
   "credential_shape_scan": "passed",
   "private_path_scan": "passed",
   "markdown_links": "passed",
   "note": "Automated checks; not a complete security audit or live-host compatibility certification.",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "package": "jobfinder-skill",
   "workflow_protocol": "workflow-1.1",
   "tests": "python -m unittest discover -s tests -t tests"

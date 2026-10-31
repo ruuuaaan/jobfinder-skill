@@ -51,7 +51,9 @@
 
 ## 3. 阶段与任务状态
 
-- 全局顺序：`official → recruitment → bendibao_web → public_accounts`。用户明确只选部分渠道时按所选裁剪，不强行补回未选渠道。
+- 全局顺序：`official → recruitment → campus → bendibao_web → public_accounts`。用户明确只选部分渠道时按所选裁剪，不强行补回未选渠道。
+- `campus`（高校就业网，渠道名 `campus_job`）是独立阶段：排在招聘平台之后、本地宝之前。入口与执行要点见[campus.md](campus.md)。
+- **预算分渠道配额**：`budget.per_channel = {"official_career": 10, "51job": 5, ...}`。给了就按渠道各自计数、互不侵占；某渠道用完时该渠道回执被拒收（报错写明配额与已用次数），剩余任务在关闭阶段时转 `budget_exhausted`。没给 `per_channel` 则退回单池模式（`searches_per_city` 全渠道共享）。`budget_used` 同时记三本账：`searches`（城市总）、`by_stage`（阶段）、`by_channel`（渠道）。
 - **渠道必须由用户显式选择**：`start-run` 不接受"按配置默默决定"。缺 `--channel/--all-channels` 直接报错并列出可选渠道；选了计划里没有的渠道也报错。渠道清单以 `workflow.CHANNEL_INFO` 为准（官网、前程无忧、智联、BOSS、猎聘、领英、本地宝网站、本地宝公众号）。
 - 只覆盖部分阶段时，运行会记录 `scope.coverage=partial_scope`：用户确认过才可能判 `COMPLETE`，否则最高 `PARTIAL` 并写明未纳入哪些阶段。
 - 渠道映射：`official_career/public_recruitment → official`；`zhaopin/boss/liepin/51job/linkedin → recruitment`；`bendibao_web → bendibao_web`；`bendibao_wechat → public_accounts`；`manual_import` 不进入任务簿。

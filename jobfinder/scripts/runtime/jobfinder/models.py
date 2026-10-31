@@ -92,6 +92,9 @@ class SalaryConfig(Model):
 class Budget(Model):
     searches_per_city: int = Field(default=40, ge=1, le=200)
     per_city: dict[str,int] = Field(default_factory=dict)
+    # 分渠道配额：{"official_career": 10, "51job": 5, ...}。给了就按渠道各自计数，
+    # 渠道之间不再互相抢额度；没给则退回 per_city/searches_per_city 的单池模式。
+    per_channel: dict[str,int] = Field(default_factory=dict)
     companies_per_city: int | None = Field(default=None, ge=1, le=100)
     requests: int | None = Field(default=None, ge=0, le=100)
     timeout: float = Field(default=12, gt=0, le=30)

@@ -15,10 +15,13 @@ from jobfinder.planning import build_plan, fingerprint  # noqa: E402
 from jobfinder.spec import matching_config  # noqa: E402
 from jobfinder.models import now  # noqa: E402
 
-FOUR = ['official_career', '51job', 'bendibao_web', 'bendibao_wechat']
+# 全阶段渠道集（名字沿用 FOUR：阶段从四类扩到五类后仍保留原名，避免大量测试改名）。
+# 覆盖 official / recruitment / campus / bendibao_web / public_accounts 各一个渠道。
+FOUR = ['official_career', '51job', 'campus_job', 'bendibao_web', 'bendibao_wechat']
 
 
-def config_dict(channels=None, *, city='北京', role='薪酬经理', budget=40, public_only=False):
+def config_dict(channels=None, *, city='北京', role='薪酬经理', budget=40, public_only=False,
+                per_channel=None):
     return {
         'config_kind': 'user',
         'user_input_confirmed': True,
@@ -34,6 +37,7 @@ def config_dict(channels=None, *, city='北京', role='薪酬经理', budget=40,
         'unknown_policy': 'review',
         'sources': list(channels or FOUR),
         'budget': {'requests': None, 'searches_per_city': budget, 'companies_per_city': None,
+                   'per_channel': dict(per_channel or {}),
                    'timeout': 12, 'retries': 0, 'domain_interval': 1},
         'search_provider': 'codex_assisted',
         'rules_version': 'CN_MAINLAND-4.0',
