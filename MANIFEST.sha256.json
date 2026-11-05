@@ -1,12 +1,12 @@
 {
   ".gitattributes": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
-  ".github/workflows/check.yml": "821979a987ac137d731198b11831d524d71bea2fbf7c84bb183828ded6491fa3",
+  ".github/workflows/check.yml": "230909732838e04daf77c9b64158cb6fcf62c69bf2e946d0454e8c226fba42a6",
   ".gitignore": "67819570f62e0562c154fdb185bcbe3d6e6dcb69ce015e1f783b9d1e82b8f6ff",
   "CHANGELOG.md": "8d1a86ec167e332807e9d07825457699a429b004ebd7896ee9c79cde8462fc4b",
   "DATA_SCHEMA.md": "aa59373510195498c8986e0105960ac986cb26c76e18088064f7ba30018bc9a7",
   "LICENSE": "0e96be01fe9c50ac3114090b343d5b971c060dccc6aec5a1623e4e64484e0a35",
   "README.md": "e23f3248480948c2d5a89d96f28089e1aa2d8d657bec19d72bd22a5701818881",
-  "RELEASE-CHECK.json": "a8cae45cb4c91869f70b8973ff38bb1ba54f847704bb73002b3118e9b57823e2",
+  "RELEASE-CHECK.json": "8f52e15823b468b4531c9d45eb4506a7ce5b0ed3e9c66fa729e3fe783907d2e8",
   "RELEASE_VALIDATION.md": "1e2c8c3688ebc66acee992b78761729d85d329862668c507ba0608df478ce7c2",
   "SECURITY.md": "2cc57ef8f7d68bc05659bd8571be6f856cdc9e239e037c02b32d2a30fd9c58ee",
   "THIRD_PARTY_NOTICES.md": "d735cb523e4a516c2c1fa00fa98eaa3d650597edb276980d348c31691962dc6c",
@@ -100,6 +100,7 @@
   "jobfinder/tests/test_linkedin_quality.py": "c5f3760b6114427a3d3655c61a68d91c123719c7267d291d995bbc38482c8fa1",
   "jobfinder/tests/test_receipts.py": "ffb46a4331787e60fe626db78ed439f3c42000c4c2c64c454465d79eca8e9352",
   "jobfinder/tests/test_scope_and_cooldown.py": "cac6f68eea4c9f850950ad39dea61c20f5d94da8d0b72eb48c314c62fa52a8ce",
+  "scripts/ci_report.py": "214626970a288ccb10ed764238fb31386d7b6b9a65e0dbb2a59f2b7da8215fbd",
   "scripts/demo_workflow_trace.py": "7e32a32f29534531419be2cda8720cb04dd4319d61d70996ce3019168a11629b",
   "scripts/smoke_release.py": "0bd8cb81a42339e88e5d66626e7c0e663e95d0e3b0a950adcf96810b66ea872c",
   "scripts/update_manifest.py": "782bbbe4ce1e2254365f0629b31c9a68f2d9afd425da400a0571c821a90b5613"

@@ -17,4 +17,12 @@ jobs:
       - name: Portable package and offline pipeline
         run: python scripts/smoke_release.py
       - name: Controller and core tests
-        run: python -m unittest discover -s jobfinder/tests
+        shell: bash
+        run: |
+          status=0
+          python -m unittest discover -s jobfinder/tests -v > unit-tests.log 2>&1 || status=$?
+          tail -60 unit-tests.log
+          if [ "$status" -ne 0 ]; then
+            python scripts/ci_report.py unit-tests.log
+          fi
+          exit "$status"
