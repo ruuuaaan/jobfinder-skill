@@ -56,25 +56,34 @@ candidates 每项至少包含 query、url、title、discovered_at、source_chann
 
 首次在本机启用浏览器通道的开关入口、扩展安装、自检方法和证据等级，见[首次安装配置清单](setup.md)。未完成配置时，控制器把该平台记为 `blocked`（附能力检测证据）并继续其它可访问渠道，不写成"零岗位"；登录态证据记 `browser_visible_dom`，不能冒充 Python HTTP 成功或官方完整详情。
 
-## 宿主适配接口（登录与可见浏览器）
+## 本机独立浏览器（0.6.0 起的默认通道）
 
-控制器不假设任何品牌的 API。宿主需要把下列能力映射到自己的工具上，并把结果作为 `record-action` 的输入交给核心：
+技能自带 `browser_backend.py`，**不需要宿主提供浏览器控制开关**：它直接探测系统已安装的
+Chrome / Edge，用专用配置目录启动独立进程，通过 CDP 建标签页、读可见 DOM。CLI 侧入口是
+`browser-status / auth-open / auth-probe / browser-stop`。
 
-| 接口 | 用途 | 缺失时的表现 |
+| 能力 | 谁提供 | 缺失时的表现 |
 |---|---|---|
-| `detect_capabilities` | 报告是否有用户可见、可操作的浏览器、能否读 DOM、能否把控制权交给用户 | 该平台记 `blocked`，理由写"未提供可见浏览器/登录交接" |
-| `open_visible_tab` | 打开平台登录入口或目标页，返回 `browser_context_id`、`tab_id` | 无法进入 `wait_user_auth`，只能 `blocked` |
-| `read_dom` | 读取当前页面可见内容并存成本轮快照文件 | 登录核验无法进行（核心必须自己读快照） |
-| `handoff_to_user` | 让用户在同一标签页完成登录、验证码、二次验证 | 记录 `waiting_user`，等待用户 |
-| `inspect_session` | 登录后重新读取页面，产出核验用快照 | 无法 `auth_probe`，任务保持 `pending` |
-| `resume` | 登录完成后回到原任务 | 该平台任务不推进，其他渠道继续 |
+| 探测可执行文件 | 技能（文件系统） | `browser-status` 返回 `unavailable` 且 `requires_local_connector=true` |
+| 启动窗口、维护会话 | 技能（子进程 + `service.json`） | 启动失败给出具体原因（无图形会话/端口占用/目录不可写） |
+| 打开登录页 | 技能（CDP 新建标签页） | `auth-open` 返回结构化错误，不会"假装已打开" |
+| 读可见 DOM | 技能（`Runtime.evaluate`） | 快照缺失或页面未就绪 → 核验失败，不猜内容 |
+| 用户完成登录/验证码 | 用户本人 | 记录 `waiting_user`，等用户操作 |
+| 登录核验 | 技能（快照 + 账号区域结构 + URL） | 不通过则任务保持 `pending` |
 
 约束：
 
-- 快照必须由宿主写成文件并落在 `data/runs/<run_id>/` 内；核心自己读文件、自己算哈希、自己匹配平台标记。宿主不得直接把 `logged_in=true` 传给核心。
-- `browser_context_id`/`tab_id` 由宿主提供，核心只校验与 `auth_open` 记录一致；换了会话或标签页要重新核验。
+- 快照由技能写成文件并落在 `data/runs/<run_id>/` 内；核心自己读、自己算哈希、自己核对账号区域。
+  宿主/模型不得直接把 `logged_in=true` 传给核心。
+- `browser_session_id`/`tab_id` 由后端生成，模型只能引用。会话重建、标签页关闭、换账号都要重新核验。
 - 不读取、不导出 Cookie 与账号凭据；不代填密码；遇验证码停下交用户处理。
-- 没有该接口的宿主（例如纯终端 agent）仍可使用 `public_only` 匿名模式，或把平台记 `blocked` 后继续其他渠道——但**不能**把该平台算作已完成。
+- 云端运行的 agent 若不在用户本机，必须由用户在本机运行连接程序；`requires_local_connector=true`
+  时**不得**声称"云端窗口就是用户本机浏览器"，也不得回退到内嵌预览。
+- 仍支持"宿主自带浏览器工具"的接法：宿主用自己的工具打开页面、读 DOM、写成快照，再通过
+  `record-action` 提交 `auth_open`/`auth_probe`，但必须提供真实句柄，否则 core 会拒收。
+
+没有可用浏览器时（纯终端、无图形会话、云端无连接程序）：使用 `public_only` 匿名模式，
+或把平台记 `blocked`/`capability_gap` 后继续其他渠道——但**不能**把该平台算作已完成。
 
 协议细节与状态机见[运行控制器协议](workflow.md)。
 
@@ -86,4 +95,14 @@ candidates 每项至少包含 query、url、title、discovered_at、source_chann
 
 ## 已验证范围
 
-自动化验证包括独立目录安装、普通 Python 子进程调用、通用查询回执、离线导出、旧回执兼容，以及运行控制器的阶段顺序 / 登录前置 / 完成度判定（`tests/` 下的合成数据与受控 DOM）。没有安装并逐一操作所有第三方 agent；它们的技能发现、工具权限和浏览器接口需在首次使用时确认。**真实平台登录尚未在本仓库内验证**：受控测试只证明控制逻辑，不代表某站点登录已验收。Skill 不附带模型 API，也不提供独立联网后台；需要本机网页服务请选择 Agent 版。
+自动化验证包括独立目录安装、普通 Python 子进程调用、通用查询回执、离线导出、旧回执兼容、
+运行控制器的阶段顺序 / 登录前置 / 完成度判定，以及本机浏览器后端的启动、标签页、DOM 读取与进程复用
+（`tests/` 下 85 个用例；真实浏览器用例需显式设置 `JOBFINDER_TEST_BROWSER=1`）。
+
+本机实测（2026-11-02，Windows + Chrome 156）：`browser-status` 检出 Chrome/Edge；独立进程启动、
+同配置目录复用同一 `session_id`；打开 `passport.zhaopin.com/login` 后读取快照，未登录状态下
+`auth-probe` 正确失败并给出四项原因。**真实登录（用户输入账号）尚未验证**：那一步必须由用户完成。
+明细见[验证记录](validation.md)。
+
+没有安装并逐一操作所有第三方 agent；它们的技能发现、工具权限仍需在首次使用时确认。
+Skill 不附带模型 API，也不提供独立联网后台。

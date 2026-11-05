@@ -153,3 +153,62 @@
 动态站点按[浏览器采集](browser-collection.md)保存可见原文。智联整页操作按[zhaopin-onsite.md](zhaopin-onsite.md)。公共工具不可用时保留限制与接续位置。
 
 任意招聘系统自动适配、无限制访问受阻平台、任意 PDF/海报/二维码提取、全国企业目录自动同步均不是本版承诺。不同宿主的浏览器集成按[能力契约](host-compatibility.md)判断。
+
+## 领英（LinkedIn）：只有人工辅助，没有自动抓取
+
+**结论先说**：领英不属于"登录就能读"的渠道。平台明确禁止未经许可的抓取软件
+（<https://www.linkedin.com/help/linkedin/answer/a1341387/prohibition-of-scraping-software?lang=en>），
+所以本技能对它只提供两条路径：
+
+1. **assisted_manual（默认，可用）**：本机独立浏览器登录 → 用户在站内自己搜索 Jobs、设关键词与地点 →
+   用户把岗位原文交给助手 → `linkedin-import` 入库匹配。覆盖范围就是用户实际打开的那几条，不是站内全量。
+2. **licensed_api（默认关闭）**：只有用户能给出明确的平台许可证据才启用；未接通前不得声称"自动搜索"。
+
+**已实测（2026-11-02）**：`auth-open` 能打开 `https://www.linkedin.com/login` 并返回真实标签页句柄；
+未登录时 `auth-probe` 正确失败（URL 命中 `/login`、页面出现登录文案、导航无账号区域链接）。
+站内搜索结果、岗位详情自动读取**未实测**，因为默认模式本来就不做这件事。
+
+**字段边界**：
+
+| 字段 | 规则 |
+|---|---|
+| 工作地点 | 只用岗位原文；`China`/`Beijing, China` 按原文解析，只写 `China` 时判 `UNKNOWN` 进 REVIEW |
+| 薪资/学历/经验 | 原文没写就留空，不补、不猜 |
+| 学历 | `Bachelor's degree preferred` → UNKNOWN（优先不等于门槛）；`or equivalent experience` → UNKNOWN |
+| 投递 | 详情入口 / 投递入口 / Easy Apply / 外部企业入口分开记，`auto_applied=false` |
+| 来源 | `source_channel=linkedin`、`source_type=platform`；不能套用官网处理器 |
+
+**不做**：翻页、猜 `jobs/view/<id>`、调内部 GraphQL、轮换账号/代理、绕验证码。
+用户没提供原文时，宁可报"该渠道无数据"并保留缺口，也不生成看起来完整的空表。
+
+详见[领英渠道](linkedin.md)。
+
+## 广州 × 财务BP 实操记录（2026-11-02 实测，平台渠道）
+
+> 本节是 2026-11-02 平台渠道实测记录，随 0.6.2 一并入库；样本只证明当时路径，不作本次结果。
+
+**城市参数（广州）**：智联 `jl=763`；BOSS `city=101280100`；猎聘 `dqs=050020`；前程无忧 `jobArea=030200`。换城市必须换码，否则会被甩到默认城市页（BOSS 默认北京、猎聘移动端默认杭州）。
+
+| 渠道 | 有效入口 | 单页产出 | 卡点 |
+|---|---|---|---|
+| 前程无忧 | 类目页 `jobs.51job.com/guangzhou/caiwufenxijingli/`（广州 × 财务分析经理/主管） | 20 条/页，含职责原文与岗位直链 | 该类目广州只有 3 页；`p4/`、`p5/` 返回「对不起，没有找到符合你条件的职位」，可作到底判据 |
+| 智联 | `zhaopin.com/jobs/?jl=763&kw=财务BP` | 首屏 20 条 | 薪资全「-元」；卡片不给岗位 id，只给公司主页；`&p=2` 返回同一批并提示「登录查看更多」；全程只有首条暴露 `jobdetail/…htm` |
+| BOSS | `zhipin.com/web/geek/job?query=财务BP&city=101280100` | 一屏 15 张卡片（截图可读全），DOM 只暴露 6 条 `/job_detail/<id>.html` | 未登录=简历上传空壳；薪资/经验/学历是纯文本、被可见 DOM 过滤；`cua scroll` 两次超时；详情页 WebFetch 返回「正在加载中」空壳 |
+| 猎聘 | 列表 `liepin.com/zhaopin/?key=财务BP&dqs=050020`；详情 `liepin.com/job/<id>.shtml` | 列表 DOM 仅 2 条链接，但 a 标签文本自带「岗位名【广州-区】薪资 经验 学历」 | 列表前端渲染 + 虚拟滚动；**详情页 WebFetch 完整可读**（薪资/地区/经验/学历/更新时间/职责/公司简介） |
+| 官网 | `career.huawei.com/cn/job-details?advertisementId=<id>` | 详情全可读 | `careers.cvte.com` 跳登录；`job.fandow.com`、`jobs.usmile.com` 前端渲染；`trauer.com.cn` 返回阿里云虚机报错页 |
+
+**打法（按可读性排序）**
+
+1. 先 51job 类目页 `p1→p3`，每页记 URL / 条数 / 是否到底；
+2. BOSS 用整页截图读卡片拿「标题 + 公司 + 薪资 + 区域」，DOM 只用来补详情链接；
+3. 猎聘拿到 `<id>` 就开详情页；id 从列表 a 标签文本或外部检索定位（详情页可读，难点只在拿 id）；
+4. 官网只用来确认「是否还在招」；社招库缺失的企业（如广汽）直接记「官网无公开社招库」，不要硬找。
+
+**平台渠道入库的现实约束**：核心对 `access_mode=browser_session` 的渠道一律拒绝 Python HTTP（`requires_authorization`）。可行路径是把登录态读到的原文写成 Job 记录，用 `candidate.local_file` + `authorized_import=true` 走 `process-candidates`。`new-search --run` 的 `merge_receipt` 会重放 state 全部任务，缺 `executed_at` 直接报错，不适合二次入库。
+
+**具体坑**
+
+- 薪资归一化要认 `k/K`：`28-35k` 不认 k 会被当成 35 元，排序全乱。
+- 回执 `executed_at` 用系统时间（`date`）取；手填预估时间写进未来会被「查询执行时间不能在未来」拒收。
+- 登录核验走宿主浏览器（扩展连的用户 Edge，`browser_id=2`）：`host-open` + `host-probe`，DOM 里要有「简历 / 我的投递 / 谁看过我」这类账号区链接才判 verified。
+- 独立 profile 的 Edge 窗口可能不出现在用户桌面（本轮首试即失败），优先宿主浏览器通道。

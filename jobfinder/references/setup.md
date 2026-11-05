@@ -1,6 +1,6 @@
 # 首次安装配置清单
 
-> 第一次在本机使用本技能时，先读完本文件再开始任何真实检索。第三级（浏览器控制）未配置时，登录态与 JavaScript 渠道无法读取，只能跑离线样例。
+> 第一次在本机使用本技能时，先读完本文件再开始任何真实检索。第三级（本机独立浏览器）不可用时，登录态与 JavaScript 渠道无法读取，只能跑离线样例或 `public_only` 匿名模式。
 
 第一次在本机使用本技能，按 A → B → C 三级逐层确认。**做到哪一级，就只能宣称哪一级的能力**；未完成的级别按 `needs_help` 记录，不得写成"零结果"或"已覆盖"。
 
@@ -8,7 +8,7 @@
 |---|---|---|
 | **A** | 离线样例、重导出、只处理用户提供的链接 | Python 3.11+ 与终端 |
 | **B** | 真实检索：发现岗位、生成计划、回执入库 | A + 宿主联网搜索工具 |
-| **C** | 智联/BOSS 等登录态页面、JavaScript 空壳页 | B + 浏览器控制与浏览器扩展 |
+| **C** | 智联/BOSS 等登录态页面、JavaScript 空壳页 | B + 本机已安装 Chrome/Edge |
 
 只完成 A 时，**不得声称"已搜索"，也不得输出真实岗位表**（合成样例只能放 `outputs/test/`）。
 
@@ -47,7 +47,12 @@ python -m venv <ENV>
 
 不能时：只跑离线样例，或处理用户直接提供的链接（记 `provided_links`，不能称"新搜索"）。
 
-## C. 浏览器控制与扩展（登录态页面必做）
+## C. 本机浏览器（登录态页面必做）
+
+> **两条通道，宿主机优先**：如果宿主自带浏览器工具（WorkBuddy 内置浏览器，或扩展连的用户自己浏览器），
+> 平台渠道直接用那条：浏览器打开 → 用户登录 → 工具输入检索 → 读可见 DOM，登录核验用 `host-open` + `host-probe`。
+> 本文下面讲的专用 profile（`auth-open` / `auth-probe`）是**备用通道**，只在宿主没有浏览器工具时使用。
+> 两条通道的能力差异见[可见浏览器采集](browser-collection.md)。
 
 ### 为什么需要
 
@@ -56,17 +61,47 @@ python -m venv <ENV>
 | 智联 | 未登录时薪资显示"-元"，拿不到实数，岗位只能落 REVIEW |
 | BOSS | 返回 JavaScript 空壳，抓取读不到任何岗位信息 |
 | 猎聘 / 前程无忧 | 公开详情通常可读，登录主要补"是否仍开放"和列表分页 |
+| 领英 | 登录也不等于平台许可自动化；只支持人工辅助 + 用户提供原文 |
 
-### 配置步骤
+### 安装与最小运行
 
-1. 桌面端 **设置 → Agent → 浏览器控制**，打开开关
-2. 安装 WorkBuddy 浏览器扩展（Chrome / Edge / QQ 浏览器任一）
-3. 确认扩展状态为"已连接"，并保持该浏览器窗口不关闭
-4. 需要登录态的渠道，**由用户自己完成登录**
+技能**不下载、不安装**浏览器，直接用系统已装的 Chrome / Edge：
+
+1. 确认装了 Chrome 或 Edge（任意一个即可；装了多个时优先 Chrome）
+2. 跑能力探测，看到 `installed` 里列出可执行文件：
+   ```text
+   <ENV_PYTHON> "<SKILL_DIR>/scripts/run.py" --workspace "<WORKSPACE>" browser-status
+   ```
+   `status=available_not_running` 表示可用但尚未启动；`unavailable` + `requires_local_connector=true`
+   表示本机没有浏览器（云端环境需要用户在本机运行连接程序）。
+3. 打开登录页（真实独立窗口，不是内嵌预览）：
+   ```text
+   <ENV_PYTHON> "<SKILL_DIR>/scripts/run.py" --workspace "<WORKSPACE>" auth-open --run <run_id> [--channel zhaopin]
+   ```
+4. 用户在窗口里登录，然后核验：
+   ```text
+   <ENV_PYTHON> "<SKILL_DIR>/scripts/run.py" --workspace "<WORKSPACE>" auth-probe --run <run_id> --channel zhaopin
+   ```
+   `status=verified` 才允许该平台业务搜索；`failed` 会列出具体原因（停在登录页、有密码框、没有账号区域链接等）。
+5. 用完可 `browser-stop` 关闭；登录态由浏览器自己持久化在
+   `<WORKSPACE>/data/browser/profile`，下一轮会复用（仍会重新核验）。
+
+可选环境变量：
+
+| 变量 | 用途 |
+|---|---|
+| `JOBFINDER_BROWSER_PATH` | 指定 Chrome/Edge 可执行文件（多版本或非标准安装时） |
+| `JOBFINDER_BROWSER_PROFILE` | 换一个专用配置目录（默认 `<WORKSPACE>/data/browser/profile`） |
+| `JOBFINDER_BROWSER_HEADLESS=1` | 无图形会话/CI 用；正常使用不要开，否则用户看不到登录窗口 |
+
+常见启动失败原因：`--user-data-dir` 不可写（换目录）、端口被占（关掉旧实例或换配置目录）、
+无图形会话（远程/服务环境，需要本机连接程序）。
 
 ### 每次检索开始前要做（不是只装一次）
 
-浏览器控制开关是一次性配置，**登录不是**。每轮真实检索开始前，助手要先替用户把渠道页打开，再让用户登录，然后才发第一条查询。
+浏览器装好后是长期可用的，**登录不是**。每轮真实检索开始前，控制器会先要求登录交接：
+`next-action` 给出 `open_auth_tab` → `auth-open` 一次性打开本阶段所有待登录平台的登录页 →
+用户逐个登录 → `auth-probe` 核验 → 才发第一条查询。
 
 | 渠道 | 打开这个地址 |
 |---|---|
@@ -74,18 +109,30 @@ python -m venv <ENV>
 | BOSS | `https://www.zhipin.com/web/user/?ka=header-login` |
 | 猎聘 | `https://passport.liepin.com/` |
 | 前程无忧 | `https://login.51job.com/login.php` |
+| 领英 | `https://www.linkedin.com/login` |
 
-顺序要求：**先开页面 → 用户登录 → 由控制器核验会话 → 才开始搜索**。实际执行时不要手工记这套顺序，交给运行控制器：`start-run` 后 `next-action` 会给出 `open_auth_tab`，用户登录完再提交 `auth_probe`，核验通过才放行该平台的搜索（见[运行控制器协议](workflow.md)）。不要先搜一轮发现拿不到薪资再回头问登录，那样等于白跑一轮，还会把"未登录"的结果误当成"没有岗位"。
+顺序要求：**先开页面 → 用户登录 → 控制器核验会话 → 才开始搜索**。不要先搜一轮发现拿不到薪资再回头问登录，
+那样等于白跑一轮，还会把"未登录"的结果误当成"没有岗位"。
 
-核验方式改了：**不看薪资数字**（它属于内容完整性，不证明登录）。`auth_probe` 由核心读取页面快照、自己算哈希，并要求出现该平台的账号专属 UI 标记（如 51job 的"我的51job/退出登录"）、没有登录表单或验证码遮罩、且 `browser_context_id`/`tab_id` 与开页记录一致。薪资显示"-元"或 BOSS 空壳只能作为"疑似未登录"的辅助信号，仍以核验结果为准。
+核验**不看薪资数字**（它属于内容完整性，不证明登录），也不看"整页任意位置出现某个词"。
+`auth-probe` 由核心读取当前标签页快照、自己算哈希，并要求：
 
-登录态绑定当前浏览器窗口，用户关窗或退出后立即失效；跨轮次续跑要重新确认，不要假设上一轮的登录还在。
+1. 存在真实的打开事件（`browser_session_id` + `tab_id` + `surface=external_browser`）；
+2. 会话仍是同一个（浏览器没被重开、标签页没被关）；
+3. URL 不在登录/风控路径（`/login`、`/authwall`、`/checkpoint`、`/challenge`…）；
+4. 页面没有密码输入框、登录表单、验证码组件；
+5. 导航锚点里有该平台的**账号区域链接**（我的投递/消息/个人中心等），头部有账号视图标志文案。
+
+登录态绑定当前浏览器进程与标签页：用户关窗、重开浏览器（`session_id` 变化）、退出或切换账号后，
+原核验立即失效，下一次动作会要求重新 `auth-open` + `auth-probe`。有效会话可以跨轮次复用，
+但每轮仍会重新核验，不需要用户反复退出登录。
 
 ### 配置后的自检
 
-- 请助手读取一个已知页面并能返回可见正文 → 通道可用
-- 仍读不到：先查扩展是否装在你实际使用的那款浏览器、是否多开浏览器 profile、是否被其他扩展拦截
-- 自检不通过时记 `needs_help`，继续其它可访问渠道，不要反复重试同一动作
+- `browser-status` 能列出可执行文件、`status` 不是 `unavailable`
+- `auth-open` 能在桌面弹出独立窗口（不是内嵌预览、不是只打印链接）
+- 用户登录后 `auth-probe` 返回 `verified`，并给出 `account_links_matched`
+- 自检不通过时记录结构化原因（能力缺口/登录失败/标签页关闭），继续其它可访问渠道，不要反复重试同一动作
 
 ### 三条不可越过的线
 
@@ -106,8 +153,8 @@ python -m venv <ENV>
 | 工作目录 | `init` 后 `configs/`、`data/`、`outputs/` 齐备，且不在技能目录内 |
 | 配置形式 | 真实任务配置以标准 spec 形式保存，`validate-config` 通过 |
 | 联网搜索 | 能调用宿主搜索工具并拿到真实结果 |
-| 浏览器通道 | 能读取一个已知页面的可见正文 |
-| 渠道登录 | 检索前由控制器发起开页，用户完成登录，`auth_probe` 返回 `verified`；薪资是否为实数不参与登录判定 |
+| 浏览器通道 | `browser-status` 列出 Chrome/Edge；`auth-open` 能弹出独立窗口 |
+| 渠道登录 | 检索前由控制器发起开页，用户完成登录，`auth-probe` 返回 `verified`；薪资是否为实数不参与登录判定 |
 
 ## 首次真实任务的建议
 

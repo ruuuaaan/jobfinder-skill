@@ -11,6 +11,65 @@ from .input_rules import recruitment_terms
 
 EDUCATION = {"小学": 0, "初中": 0.5, "高中": 1, "中专": 1, "中技": 1, "职高": 1, "大专": 2, "专科": 2, "本科": 3, "硕士": 4, "博士": 5}
 
+# 已确认的中英文同义岗位词：既用于检索词扩展，也用于标题匹配。
+# 只收录可靠同义（同一实际职能），不把相邻职能（财务BP ↔ 会计）并进来。
+ROLE_SYNONYMS = {
+    "财务bp": ["finance bp", "financial bp", "finance business partner", "财务业务伙伴", "财务伙伴"],
+    "财务分析": ["financial analysis", "financial analyst", "fp&a", "财务分析员"],
+    "软件测试": ["software test", "software testing", "qa engineer", "test engineer", "软件测试工程师"],
+    "自动化测试": ["automation test", "test automation", "sdet", "automation qa", "自动化测试工程师"],
+    "测试开发": ["sdet", "test development", "software development engineer in test"],
+    "人力资源": ["human resources", "human resource", "hr", "hr generalist", "人力资源专员"],
+    "招聘": ["recruiter", "talent acquisition", "recruitment", "招聘专员"],
+    "薪酬": ["compensation", "c&b", "compensation & benefits", "total rewards", "薪酬福利"],
+    "绩效": ["performance management", "performance", "绩效管理"],
+    "产品经理": ["product manager", "product owner", "pm", "产品策划"],
+    "数据分析": ["data analyst", "data analysis", "business analyst", "bi analyst", "数据分析师"],
+    "运营": ["operations", "operation", "运营专员"],
+    "市场营销": ["marketing", "market", "市场营销专员"],
+    "销售": ["sales", "sales manager", "销售代表", "销售经理"],
+}
+
+
+def _role_text(value):
+    return re.sub(r"[\s\-_/·]+", "", str(value or "")).casefold()
+
+
+def synonyms_for(keyword):
+    """返回该岗位词已确认的中英文同义词（不含原词本身）。"""
+    target = _role_text(keyword)
+    if not target:
+        return []
+    out = []
+    for key, values in ROLE_SYNONYMS.items():
+        normalised = _role_text(key)
+        if normalised and (normalised in target or target in normalised):
+            out.extend(values)
+    seen, result = {target}, []
+    for value in out:
+        norm = _role_text(value)
+        if norm and norm not in seen:
+            seen.add(norm)
+            result.append(value)
+    return result
+
+
+def role_match(title, keywords):
+    """标题与岗位词的匹配。中文词未出现在英文标题时，转待确认而不是硬排除。"""
+    target = _role_text(title)
+    for keyword in keywords:
+        norm = _role_text(keyword)
+        if norm and norm in target:
+            return decision("PASS", "标题命中用户明确的岗位关键词")
+    expanded = {k: synonyms_for(k) for k in keywords}
+    for keyword, values in expanded.items():
+        for value in values:
+            if _role_text(value) and _role_text(value) in target:
+                return decision("PASS", f"标题命中已确认同义岗位词「{value}」（对应「{keyword}」），需按职责复核范围")
+    if re.search(r"[A-Za-z]{3}", title or "") and any(expanded.values()):
+        return decision("UNKNOWN", "英文标题未出现该岗位的已确认同义词；须按原文职责复核，不能仅凭标题排除")
+    return decision("FAIL", "仅比较用户明确的岗位关键词，不扩展为销售/项目经理")
+
 
 def decision(state, reason):
     return Decision(state=state, reason=reason)
@@ -212,7 +271,8 @@ def evaluate(job: Job, config: SearchConfig) -> list[MatchResult]:
             else:
                 geo=geo.model_copy(update={'state':'UNKNOWN','reason':'岗位地点原文冲突：'+' / '.join(job.conflicts['location_raw'])})
         d = {"geography": decision(geo.state, geo.reason)}
-        d["role"] = decision("PASS", "用户明确不限具体职位；另行核验企业范围") if config.role_mode == "any" else decision("PASS" if any(k.casefold() in job.title.casefold() for k in config.role_keywords) else "FAIL", "仅比较用户明确的岗位关键词，不扩展为销售/项目经理")
+        d["role"] = (decision("PASS", "用户明确不限具体职位；另行核验企业范围")
+                     if config.role_mode == "any" else role_match(job.title, config.role_keywords))
         if config.role_mode == 'keywords' and job.role_review is not None:
             review = job.role_review
             same_context = review.get('role_keywords') == config.role_keywords

@@ -1,6 +1,6 @@
 # JobFinder Skill
 
-跨 Agent 的中国大陆岗位检索技能，版本 0.5.4 / MIT。
+跨 Agent 的中国大陆岗位检索技能，版本 0.6.2 / MIT。
 完整复制本仓库的 jobfinder/ 到宿主认可的技能目录。支持读取 SKILL.md 并提供文件、终端工具的 agent；实时搜索还需要宿主联网与浏览器能力。不依赖 Codex，也不附带模型 API。
 
 详细安装、命令和工具能力映射见 [跨 Agent 指南](jobfinder/references/host-compatibility.md)。

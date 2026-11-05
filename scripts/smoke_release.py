@@ -34,7 +34,10 @@ def main():
                 if p.returncode:
                     raise RuntimeError(p.stderr + p.stdout[-2000:])
             from openpyxl import load_workbook
-            book = load_workbook(work/'outputs/test/smoke/岗位汇总.xlsx')
+            # 0.6.x 起阶段性导出的文件名带运行 ID：岗位汇总_阶段性_<run_id>.xlsx
+            summaries = sorted((work/'outputs/test/smoke').glob('岗位汇总*.xlsx'))
+            assert summaries, '缺少岗位汇总工作簿'
+            book = load_workbook(summaries[0])
             assert book.active.max_column == 10
             assert book.active.freeze_panes == 'A2'
             assert book.active.auto_filter.ref.startswith('A1:J')

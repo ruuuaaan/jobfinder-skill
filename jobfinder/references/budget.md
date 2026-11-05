@@ -54,10 +54,50 @@ resume-traversal 默认 remaining：保留已用搜索/HTTP/企业计数，只�
 
 普通继续保留健康状态和累计用量；用户明确“重试”可重新启用服务，原失败 attempts 不删除。模型密钥和原始接口错误正文不写入尝试账本。
 
-## 与运行控制器的关系（workflow-1）
+## 与运行控制器的关系（workflow-1.2）
 
-- 预算账本挂在运行（`run_id`）上，**阶段切换不清零额度**：`close_stage` 只改阶段状态，`budget_used` 连续累计。
-- 只有 `record-action` 里 `status ∈ success/failed/restricted` 的真实执行才扣次数；`skip`/`blocked`/`not_run` 不扣。
-- 同一回执重复提交幂等，不重复扣费；`start-run` 时若带 `budget_used`（接续旧运行），继续在原配额上累加，不重开额度。
-- 阶段受阻或用户跳过会保留缺口，并在 `finalize` 中把整轮判为 `PARTIAL`，不会因为进入下一阶段而"抹平"上一阶段的缺口。
-- 预算耗尽的任务标 `budget_exhausted`，属于终止态：它让流程可以继续，但不算完成。
+控制器侧只有**一本账**（`jobfinder/budgets.py`），网页版那套"官网优先分配"是另一个系统的公式，不要混用。
+
+### 配额解析链
+
+```
+per_city_channel[城市][渠道] → per_channel[渠道] → per_city[城市] → searches_per_city
+```
+
+- `start-run` 把 `budget.per_city`、`per_channel`、`per_city_channel` 一起冻结进
+  `state.scope.budget`。旧版漏了 `per_city`，导致"某城 5 次、其它城 40 次"的配置在运行期被忽略。
+- **派发、回执、收尾用同一个函数**（`task_budget_remaining`）判断额度。旧版派发按渠道配额、
+  官网核实收尾却按 `by_stage` 另一本账，会出现"派发说没额度、收尾说还能跑"或反过来。
+
+### 计量类型
+
+一次真实执行 = 1 次 `search`（渠道账）+ 1 次计量类型：
+
+| 路由 | 计量类型 | 上限字段（计划 `budget_profile`） |
+|---|---|---|
+| `browse_list` | `list_page` | `list_pages_per_city` |
+| `channel_search` / `direct` / `research` | `search` | — |
+| `official_verify` / `enterprise` / `entry_reuse` / `announcement_reverse` | `detail_read` | `detail_reads_per_city` |
+
+渠道配额只约束 `search`；列表页与详情各有自己的城市上限，所以"一条查询"不能绕过详情读取预算。
+`http_requests` 与累计运行时间（`runtime_minutes`）单列，不折算成搜索次数。
+**已知招聘入口核实消耗的是该渠道的搜索配额 + 一次 `detail_read`**，与其它任务同一本账。
+
+### 计数规则
+
+- 预算账本挂在运行（`run_id`）上，**阶段切换不清零**：`close_stage` 只改阶段状态，`budget_used` 连续累计。
+- 只有 `status ∈ success/failed/restricted` 的真实执行才扣；`skip`/`blocked`/`not_run` 不扣。
+- 同一 `receipt_id` 重放幂等，不重复扣费（幂等判断在配额检查之前，所以预算耗尽后重放仍成功）；
+  同一 `attempt_id` 补证据属于修订，不重复计次。
+- 恢复运行不重置：`load_state` 读回 `budget_used` 后继续累加；`start-run --budget-mode new_run`
+  之类"开新账"必须由用户显式选择。
+- 预算耗尽的任务标 `budget_exhausted`（终止态）：让流程能继续，但算覆盖缺口，
+  原因写"配额已用尽，覆盖缺口，不代表网站没有更多岗位"。
+- 受阻/跳过保留缺口，`finalize` 判 `PARTIAL`，不会因为进入下一阶段而抹平。
+
+### 为什么不把新上限写进配置模型
+
+`fingerprint(config)` 会对 `SearchConfig` 的完整 dump 求哈希。往模型里加字段（哪怕有默认值）
+会让**所有历史配置的指纹一起变**，等于静默改写历史任务的条件。因此列表页/详情/运行时长的上限
+放在计划的 `budget_profile`，由 `start-run` 冻结进运行状态；`tests/test_legacy_compat.py`
+用固定指纹守住这条线。

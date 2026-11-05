@@ -297,6 +297,8 @@ class Job(Model):
     open_status: Literal["OPEN", "CLOSED", "UNKNOWN"] = "UNKNOWN"
     application_method: str | None = None
     application_url: str | None = None
+    # 投递入口形态：站内 Easy Apply / 外部企业入口 / 未知。只描述入口，不代表已投递。
+    apply_type: Literal["easy_apply", "external", "unknown"] | None = None
     source_url: str
     source_channel: str
     source_id: str | None = None

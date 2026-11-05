@@ -1,5 +1,6 @@
 import json
 import hashlib
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 from collections import deque
@@ -21,6 +22,8 @@ from .resources import ResourceStore, record_candidates, record_task_companies, 
 from .announcements import verify_announcement_employer, record_profile, read_announcement
 from .execution_audit import build_execution_audit, is_content_event
 
+from .channels import access_mode as channel_access_mode, label as channel_label, CHANNELS as CHANNEL_SPECS
+from . import access_control
 from .paths import WORKSPACE as ROOT
 
 
@@ -44,6 +47,60 @@ def output_path(path, mode):
 def load_config(path):
     from .spec import matching_config
     return matching_config(json.loads(local_path(path).read_text(encoding="utf-8-sig")))
+
+
+def page_cache_key(candidate):
+    """页面级缓存键：来源渠道 + 岗位/页面身份 + 查询上下文 + 账号范围。
+
+    换城市、换关键词、换账号都不会命中同一份缓存，避免把别的范围的结果复用过来。
+    """
+    return access_control.cache_key(
+        candidate.source_channel,
+        canonical(candidate.url),
+        query_context={"query": candidate.query,
+                       "cities": sorted(candidate.target_cities or []),
+                       "company": candidate.company},
+        account_scope=("browser_session" if channel_access_mode(candidate.source_channel)
+                       != "http_listing" else "anonymous"),
+    )
+
+
+def reuse_cached_page(candidate, workspace):
+    """优先复用已读取并结构化解析过的页面，避免重复打开与重复调用模型。"""
+    if candidate.local_file:
+        return None
+    try:
+        entry = access_control.cache_get(workspace, page_cache_key(candidate))
+    except (OSError, ValueError):
+        return None
+    if not entry or not entry.get("jobs"):
+        return None
+    if entry.get("content_hash") and not entry.get("retrieved_at"):
+        return None
+    return {
+        "jobs": [Job.model_validate(row) for row in entry["jobs"]],
+        "retrieved_at": entry.get("retrieved_at"),
+        "reason": "复用已读取的结构化页面结果；证据时间保持原读取时间，不冒充本次重新读取",
+    }
+
+
+def store_cached_page(candidate, jobs, workspace, retrieved_at=None):
+    """保存页面级结构化解析结果，供恢复或同范围重跑时复用。"""
+    if candidate.local_file or not jobs:
+        return None
+    payload = {
+        "schema_version": "page-cache-1",
+        "channel": candidate.source_channel,
+        "url": candidate.url,
+        "query_context": {"query": candidate.query,
+                          "cities": sorted(candidate.target_cities or [])},
+        "retrieved_at": retrieved_at or now(),
+        "jobs": [job.model_dump(mode="json") for job in jobs],
+    }
+    try:
+        return access_control.cache_put(workspace, page_cache_key(candidate), payload)
+    except OSError:
+        return None
 
 
 def import_jobs(candidate):
@@ -97,16 +154,26 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
             raise ValueError("new-search需要本次计划与实际搜索凭据；Python不能调用宿主 agent 的会话搜索")
         receipt=json.loads(local_path(candidates_file).read_text(encoding="utf-8-sig"))
         plan=json.loads(local_path(plan_file).read_text(encoding="utf-8-sig"))
-        discovery["search_log"]=validate_receipt(config,plan,receipt)
-        ensure_new_execution(plan,discovery['search_log'],ROOT/'outputs'/'real')
-        if run_id:
-            from . import workflow
-            run_state=workflow.load_state(ROOT,run_id)
-            if run_state.get('plan_id') not in (None,plan['plan_id']):
-                raise ValueError('运行状态与本次计划不一致，不能把两次运行合并')
-            workflow.merge_receipt(run_state,receipt,config,plan)
+        from . import workflow
+        run_state=workflow.load_state(ROOT,run_id) if run_id else None
+        if run_state is not None and run_state.get('plan_id') not in (None,plan['plan_id']):
+            raise ValueError('运行状态与本次计划不一致，不能把两次运行合并')
+        discovery["search_log"]=validate_receipt(config,plan,receipt,
+                                                 run_protocol=(run_state or {}).get('receipt_protocol'))
+        # 分批提交：按 run_id + task_id + attempt_id/receipt_id 去重，不同批次可连续累计。
+        if run_state is not None:
+            # 先判重（已经是本轮的同一批执行就拒绝重复入库），再登记本批，
+            # 这样第二批新任务不会因为第一批导出过而被整体拒收。
+            ensure_new_execution(plan,discovery['search_log'],ROOT/'outputs'/'real',state=run_state,run_id=run_id)
+            accepted,duplicates=workflow.claim_receipts(run_state,discovery['search_log'])
+            if duplicates:
+                discovery['duplicate_receipts']=duplicates
+            if accepted:
+                workflow.merge_receipt(run_state,receipt,config,plan)
             workflow.save_state(run_state,ROOT)
             discovery['run_id']=run_id
+        else:
+            ensure_new_execution(plan,discovery['search_log'],ROOT/'outputs'/'real')
         discovery['entry_tasks'] = plan.get('entry_tasks',[])
         for task in plan.get('entry_tasks',[]):
             if task['status'] == 'planned':
@@ -155,7 +222,7 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
     traversals=dict(checkpoint['states']) if resume_file else {}
     visited_entries=set(checkpoint.get('visited_entries',[])) if resume_file else set()
     for candidate in candidates:
-        if not candidate.local_file and candidate.source_channel in config.sources and candidate.source_channel not in ('boss','linkedin','bendibao_wechat') and candidate.candidate_type!='enterprise_directory' and (not candidate.target_cities or set(candidate.target_cities).intersection(targets)):
+        if not candidate.local_file and candidate.source_channel in config.sources and channel_access_mode(candidate.source_channel)=='http_listing' and candidate.candidate_type!='enterprise_directory' and (not candidate.target_cities or set(candidate.target_cities).intersection(targets)):
             traversals.setdefault(scope_id(candidate),initial_state(candidate,'entry_not_started'))
 
     def usage():
@@ -213,6 +280,17 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
         checklist={"legal_name":candidate.company,"official_url":candidate.official_url,"career_url":candidate.career_url,"source_url":candidate.url,"version_date":candidate.discovered_at[:10],"discovery_kind":"unknown","verification_status":"pending","notes":"搜索发现的主体/网址仍需原文与导航核实；不凭标题认定官方"}
         report.update(company=candidate.company,target_cities=candidate.target_cities,task_ids=candidate.task_ids,entry_task_id=candidate.entry_task_id,candidate_type=candidate.candidate_type,attempted=False)
         reports.append(report)
+        cached = reuse_cached_page(candidate, ROOT)
+        if cached:
+            jobs.extend(cached["jobs"])
+            report.update(access_status="cached_progress", parse_status="success",
+                          jobs_extracted=len(cached["jobs"]), attempted=False,
+                          coverage_incomplete=False, reason=cached["reason"],
+                          content_read_at=cached.get("retrieved_at"))
+            if candidate.company and not any(c.get("legal_name") == candidate.company
+                                             for c in companies):
+                companies.append(checklist)
+            return
         try:
             if candidate.candidate_type == 'enterprise_directory':
                 raise FetchError('not_run','企业目录只用于企业发现；通过import-directory/import-companies导入，不作为岗位详情读取')
@@ -233,8 +311,10 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
             else:
                 if mode=="test":
                     raise ValueError("测试模式禁止联网")
-                if candidate.source_channel in ("boss", "linkedin", "bendibao_wechat"):
-                    raise FetchError("requires_authorization","此渠道没有可用授权自动接口，只支持候选链接记录和有权提供的材料")
+                if channel_access_mode(candidate.source_channel) != "http_listing":
+                    raise FetchError("requires_authorization",
+                        f"{channel_label(candidate.source_channel)}没有可用的授权自动接口，"
+                        "只支持候选链接记录、本机可见浏览器读取和用户有权提供的材料")
                 if candidate.source_channel == 'official_career':
                     candidate,page,employer_pages,extracted = yield from read_entry_steps(fetcher,candidate,config,store,reports,report,resume_states,visited_entries)
                     checklist.update(verification_status='source_classified_no_identity_gate',
@@ -348,6 +428,8 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
                                                 'content_hash':evidence.content_hash,'entity_name':j.company,
                                                 'kind':'job','subject_relation':'self'})
             jobs.extend(extracted)
+            if report.get('access_status') == 'success' and extracted:
+                store_cached_page(candidate, extracted, ROOT, report.get('content_read_at'))
             if report.get('parse_status') == 'success' and not report.get('adapter') and not report.get('entry_trace'):
                 report.update(jobs_extracted=len(extracted),reason="原始内容已提取；岗位仍开放及求职条件另行判断")
         except FetchError as exc:
@@ -389,9 +471,20 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
         save_progress('interrupted')
         raise
     save_progress('finished')
-    for channel, reason in [("boss","无已配置授权自动检索；可记录候选和人工导入"),("linkedin","未经许可不自动抓取；可人工导入"),("bendibao_web","本轮未取得逐站点自动访问依据；不因一次失败认定永久不可用"),("bendibao_wechat","公众号自动获取未接入；可有权导入")]:
-        if channel not in seen_channels:
-            reports.append(dict(channel=channel,url=None,access_status="not_run",parse_status="not_run",jobs_extracted=None,reason=reason))
+    for spec in CHANNEL_SPECS:
+        if spec.name in seen_channels or spec.stage in ("none",):
+            continue
+        if channel_access_mode(spec.name) == "http_listing":
+            continue
+        reason = ("平台禁止未授权自动化：默认人工辅助，用户提供岗位原文后可入库匹配"
+                  if spec.name == "linkedin" else
+                  "无已配置的授权自动检索；可记录候选和人工导入"
+                  if spec.name == "boss" else
+                  "本轮未取得逐站点自动访问依据；不因一次失败认定永久不可用"
+                  if spec.name == "bendibao_web" else
+                  "公众号自动获取未接入；可有权导入")
+        reports.append(dict(channel=spec.name,url=None,access_status="not_run",
+                            parse_status="not_run",jobs_extracted=None,reason=reason))
     if not candidates:
         reports.append(dict(channel="search",url=None,access_status=discovery["status"],parse_status="not_run",jobs_extracted=None,reason=discovery["coverage"]))
     jobs=deduplicate(jobs)
@@ -443,6 +536,286 @@ def run(config, output, candidates_file=None, policies_file=None, mode="real", c
         snapshot=store.snapshot()
         discovery['company_library']['total_companies']=len(snapshot['companies'])
     return export_bundle(output,config,jobs,results,reports,companies,discovery,events,mode)
+
+
+def run_linkedin_import(config, material_path, output, effective=None, mode="real"):
+    """领英人工辅助路径：只处理用户提供的岗位原文，不做自动抓取。
+
+    登录/会话由本机独立浏览器完成，用户在领英站内自己搜索；这里只把用户交来的
+    原文变成带证据的岗位，走同一套 evaluate/export。来源固定 `linkedin`/`platform`。
+    """
+    from . import linkedin, workflow
+    output = output_path(output, mode)
+    source = local_path(material_path)
+    payload = json.loads(source.read_text(encoding="utf-8-sig"))
+    profile = linkedin.access_profile(payload.get("access_mode") or linkedin.DEFAULT_MODE,
+                                      payload.get("license_evidence"))
+    jobs, problems = linkedin.material_jobs(payload, mode=profile["mode"], source_ref=str(source))
+    jobs = deduplicate(jobs)
+    results = [r for j in jobs for r in evaluate(j, config)]
+    reports = [dict(channel="linkedin", url=None,
+                    access_status="user_provided_material" if jobs else "not_run",
+                    parse_status="success" if jobs else "failed", jobs_extracted=len(jobs),
+                    reason=("用户本人提供的领英岗位原文；未自动抓取、未自动投递"
+                            if jobs else "没有可用的岗位原文"),
+                    problems=problems)]
+    discovery = {
+        "provider": "user_provided_material",
+        "status": "imported_from_user_material",
+        "operation": "linkedin_assisted_import",
+        "coverage": "仅覆盖用户提供的岗位原文；不代表领英站内全部岗位",
+        "live_refetched": False,
+        "linkedin": profile,
+        "search_log": [],
+        "candidates": [{"company": j.company, "title": j.title, "url": j.source_url,
+                        "candidate_type": "job_detail", "target_cities": config.target_cities,
+                        "source_channel": "linkedin"} for j in jobs],
+        "effective_config": effective,
+        "material_problems": problems,
+    }
+    state = workflow.state_from_plan_logs({"plan_id": "linkedin-import-" + hashlib.sha256(
+        source.read_bytes()).hexdigest()[:8], "channels": ["linkedin"],
+        "effective_config": {"budget": config.budget.model_dump(mode="json")}}, [], config, reports)
+    state["scope"]["cities"] = list(config.target_cities)
+    completion = workflow.finalize(state)
+    completion["reasons"].append("领英渠道为人工辅助模式：覆盖仅限用户提供的岗位原文，不是站内全量搜索")
+    completion["partial_export"] = True
+    discovery["completion"] = completion
+    discovery["run_id"] = completion["run_id"]
+    return export_bundle(output, config, jobs, results, reports, [], discovery, events=[], mode=mode)
+
+
+def _save_browser_snapshot(directory, snapshot, label):
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = str(snapshot.get("retrieved_at") or now()).replace(":", "").replace("+", "p")
+    path = directory / f"{label}-{stamp[:19]}.json"
+    payload = dict(snapshot)
+    payload.setdefault("content_hash", hashlib.sha256(
+        str(snapshot.get("text") or "").encode("utf-8")).hexdigest())
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    snapshot["snapshot_path"] = str(path)
+    return path
+
+
+def run_linkedin_browser_search(config, output, *, keywords, location, run_id=None,
+                                max_details=None, workspace=ROOT, browser=None,
+                                mode="real", user_confirmed=False, effective=None,
+                                page_interval=None):
+    """领英浏览器辅助检索：用用户本机已登录的浏览器读少量页面，取岗位原文。
+
+    边界（写进代码，不只写文档）：
+    - 必须由用户明确同意（`user_confirmed`），否则不驱动用户浏览器；
+    - 只读 1 个站内搜索页 + 至多 `MAX_DETAILS` 条详情，不翻页、不批量；
+    - 每次页面读取之间有最小间隔，并占用该渠道预算与 `detail_read` 计量；
+    - 遇登录墙/验证码/安全检查立即停止，交回用户；
+    - 不点击投递、不提交申请、不调内部接口。
+    """
+    from . import linkedin, workflow, access_control
+    from .browser_backend import BrowserError, BrowserService
+    from .geography import normalize_city
+
+    if not user_confirmed:
+        raise ValueError("浏览器辅助检索会驱动用户本机浏览器：必须由用户明确同意"
+                         "（--user-confirmed）后才能执行")
+    if not keywords or not str(keywords).strip():
+        raise ValueError("缺少检索关键词")
+    target_city = normalize_city(str(location or ""))
+    if not target_city:
+        raise ValueError("地点必须是已审核的大陆城市，不能留空或用模糊地区代替")
+    if config.target_cities and target_city not in [normalize_city(c) for c in config.target_cities]:
+        raise ValueError(f"检索地点 {target_city} 不在本轮目标城市 {config.target_cities} 内")
+    limit = int(max_details or linkedin.DEFAULT_MAX_DETAILS)
+    if not 1 <= limit <= linkedin.MAX_DETAILS:
+        raise ValueError(f"详情页数量必须在 1–{linkedin.MAX_DETAILS} 之间（浏览器辅助是小样本）")
+    interval = linkedin.MIN_PAGE_INTERVAL_SECONDS if page_interval is None else float(page_interval)
+
+    output = output_path(output, mode)
+    profile = linkedin.access_profile("browser_assisted")
+    state = workflow.load_state(workspace, run_id) if run_id else None
+    if state is not None:
+        workflow.refresh_browser_state(state, workspace)
+        status = workflow.auth_status(state, "linkedin")
+        if status != "verified":
+            raise ValueError(f"领英登录会话未核验（当前 {status}）：请先 auth-open / auth-probe，"
+                             "浏览器辅助检索只在已核验的会话里执行")
+        cooling = access_control.cooldown(workspace, "linkedin")
+        if cooling:
+            raise ValueError("领英当前处于" + cooling.get("state", "受限") + "状态：" +
+                             str(cooling.get("reason") or "") + "；请等冷却结束或由用户显式重试")
+        age = access_control.seconds_since_browser_action(workspace, "linkedin")
+        if age is not None and age < interval:
+            raise ValueError(f"距上次领英浏览器动作仅 {age:.1f} 秒，小于 {interval:.0f} 秒间隔；"
+                             "请稍后再试，避免过快访问")
+
+    service = browser or BrowserService(workspace)
+    keywords_text = " ".join(keywords) if isinstance(keywords, (list, tuple)) else str(keywords)
+    url = linkedin.search_url(keywords_text, target_city)
+    jobs, problems, actions = [], [], []
+    checkpoint = None
+    login_required = None
+    pages_read = 0
+    tab_id = None
+    lock = access_control.platform_lock(workspace, "linkedin")
+    lock.acquire()
+    try:
+        try:
+            auth_tab = ((state or {}).get("auth", {}).get("linkedin") or {}).get("tab_id")
+            if auth_tab and getattr(service, "has_target", lambda _t: False)(auth_tab):
+                handle = {"target_id": auth_tab, "session_id":
+                          ((state or {}).get("auth", {}).get("linkedin") or {}).get("backend_session_id")}
+                service.navigate(auth_tab, url)
+            else:
+                handle = service.open(url)
+            tab_id = handle["target_id"]
+            search_snapshot = service.snapshot(tab_id, wait_seconds=12)
+            _save_browser_snapshot(output / "evidence", search_snapshot, "linkedin-search")
+            pages_read += 1      # 页面确实打开过，如实计数；是否计费另按是否读到搜索结果
+            linkedin.assert_not_blocked(search_snapshot)
+            actions.append({"step": "search", "url": search_snapshot.get("url") or url})
+            if state is not None:
+                workflow.charge_access(state, channel="linkedin", city=target_city,
+                                       count=1, note=f"领英站内搜索：{keywords_text}")
+            access_control.note_browser_action(workspace, "linkedin", run_id=run_id,
+                                               url=search_snapshot.get("url") or url)
+            links = linkedin.extract_job_links(search_snapshot.get("anchors"), limit=limit)
+        except linkedin.LinkedInCheckpoint as exc:
+            checkpoint = str(exc)
+            access_control.note_restricted(workspace, "linkedin", reason=str(exc),
+                                           kind="captcha", run_id=run_id)
+            links = []
+        except linkedin.LinkedInLoginRequired as exc:
+            # 未登录/会话失效：让该平台的登录态立即失效，任务保持 pending，等用户重新登录。
+            login_required = str(exc)
+            if state is not None:
+                workflow.invalidate_auth(state, "linkedin", login_required)
+            links = []
+        except (BrowserError, OSError) as exc:
+            raise ValueError(f"浏览器读取搜索页失败：{exc}") from exc
+
+        for link in links:
+            if checkpoint:
+                break
+            # 先看预算再开页面：额度不够时不要白白打开详情页（也减少无谓访问）。
+            if state is not None:
+                from . import budgets
+                if budgets.channel_remaining(state, "linkedin", target_city) == 0 \
+                        or budgets.kind_remaining(state, "detail_read", target_city) == 0:
+                    problems.append({"job_id": link["job_id"], "url": link["url"],
+                                     "reason": "预算不足，未继续读取详情（覆盖缺口，不代表没有岗位）"})
+                    break
+            if interval:
+                time.sleep(interval)
+            try:
+                service.navigate(tab_id, link["url"])
+                snapshot = service.snapshot(tab_id, wait_seconds=12)
+                _save_browser_snapshot(output / "evidence", snapshot, f"linkedin-job-{link['job_id']}")
+                pages_read += 1
+                linkedin.assert_not_blocked(snapshot)
+                if state is not None:
+                    try:
+                        workflow.charge_access(state, channel="linkedin", city=target_city,
+                                               kind="detail_read", count=1,
+                                               note=f"领英岗位详情：{link['job_id']}")
+                    except ValueError as exc:
+                        # 预算不足属于覆盖缺口：停在这里，不继续打开详情，也不伪装成"没有岗位"。
+                        problems.append({"job_id": link["job_id"], "url": link["url"],
+                                         "reason": "预算不足，未继续读取详情：" + str(exc)})
+                        break
+                actions.append({"step": "detail", "job_id": link["job_id"],
+                                "url": snapshot.get("url") or link["url"]})
+                access_control.note_browser_action(workspace, "linkedin", run_id=run_id,
+                                                   url=snapshot.get("url") or link["url"])
+                job = linkedin.job_from_browser_snapshot(
+                    snapshot, source_ref=snapshot.get("snapshot_path"))
+                job.discovery_cities = [target_city]
+                jobs.append(job)
+            except linkedin.LinkedInCheckpoint as exc:
+                checkpoint = str(exc)
+                access_control.note_restricted(workspace, "linkedin", reason=str(exc),
+                                               kind="captcha", run_id=run_id)
+                break
+            except linkedin.LinkedInLoginRequired as exc:
+                login_required = str(exc)
+                if state is not None:
+                    workflow.invalidate_auth(state, "linkedin", login_required)
+                break
+            except (linkedin.LinkedInAccessError, BrowserError, OSError) as exc:
+                problems.append({"job_id": link["job_id"], "url": link["url"],
+                                 "reason": str(exc)})
+    finally:
+        lock.release()
+        if browser is None and tab_id:
+            try:
+                service.close_tab(tab_id)  # 只关本次的标签页，保留登录窗口
+            except Exception:
+                pass
+
+    jobs = deduplicate(jobs)
+    results = [r for j in jobs for r in evaluate(j, config)]
+    access_status = ("restricted" if checkpoint else
+                     "login_required" if login_required else "success")
+    reports = [dict(channel="linkedin", url=url,
+                    access_status=access_status,
+                    parse_status="success" if jobs else ("partial" if problems else "not_run"),
+                    jobs_extracted=len(jobs),
+                    reason=("；".join(filter(None, [
+                        checkpoint or "",
+                        login_required or "",
+                        f"{len(problems)} 条详情未解析" if problems else "",
+                        "仅浏览器辅助小样本，未翻页、未覆盖站内全部岗位",
+                    ]))),
+                    browser_pages_read=pages_read, problems=problems)]
+    summary = {
+        "mode": "browser_assisted",
+        "keywords": keywords_text,
+        "location": target_city,
+        "pages_read": pages_read,
+        "detail_limit": limit,
+        "jobs_found": len(jobs),
+        "checkpoint": checkpoint,
+        "login_required": login_required,
+        "problems": problems,
+        "limits": profile.get("sample_limits"),
+        "actions": actions,
+        "run_id": run_id,
+    }
+    discovery = {
+        "provider": "jobfinder_local_browser",
+        "status": "browser_assisted_sample",
+        "operation": "linkedin_browser_search",
+        "channel": "linkedin",
+        "coverage": (f"领英站内搜索「{keywords_text}」@ {target_city}：读取 {pages_read} 个页面、"
+                     f"{len(jobs)} 条岗位原文；不翻页，不代表站内全部岗位"),
+        "live_refetched": True,
+        "linkedin": profile,
+        "linkedin_browser_search": summary,
+        "search_log": [],
+        "candidates": [{"company": j.company, "title": j.title, "url": j.source_url,
+                        "candidate_type": "job_detail", "target_cities": [target_city],
+                        "source_channel": "linkedin"} for j in jobs],
+        "effective_config": effective,
+        "browser_actions": actions,
+    }
+    if state is not None:
+        workflow.record_browser_search(state, "linkedin", summary)
+        completion = workflow.finalize(state, persist=False)
+        completion["partial_export"] = completion.get("verdict") != "COMPLETE"
+        completion["reasons"].append(
+            "领英为浏览器辅助小样本：仅读取 1 个搜索页与有限详情，任务簿未因此判定该范围到底")
+    else:
+        state = workflow.state_from_plan_logs({"plan_id": "linkedin-browser-" + hashlib.sha256(
+            (url + target_city).encode()).hexdigest()[:8], "channels": ["linkedin"],
+            "effective_config": {"budget": config.budget.model_dump(mode="json")}}, [], config, reports)
+        state["scope"]["cities"] = [target_city]
+        completion = workflow.finalize(state)
+        completion["reasons"].append("领英为浏览器辅助小样本，覆盖范围仅限本次读取的页面")
+        completion["partial_export"] = True
+    discovery["completion"] = completion
+    discovery["run_id"] = completion["run_id"]
+    payload = export_bundle(output, config, jobs, results, reports, [], discovery, events=[], mode=mode)
+    if run_id is not None:
+        workflow.save_state(state, workspace)
+    return payload
 
 
 def reexport(config, existing, output, effective=None):

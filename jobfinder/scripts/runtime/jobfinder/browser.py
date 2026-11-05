@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .models import Evidence, Job, now
 from .matching import deduplicate, evaluate
-from .exporter import export_bundle
+from .exporter import export_bundle, SUMMARY_HEADERS
 from .planning import effective_config, fingerprint
 
 
@@ -32,7 +32,7 @@ def section(text, starts, ends):
     return rest[:end.start()].strip() if end else rest.strip()
 
 
-def parse_detail(detail, snapshots, company_spec):
+def parse_detail(detail, snapshots, company_spec, *, channel='official_career'):
     page = snapshots[detail['snapshot_id']]
     listing = snapshots[detail['card']['snapshot_id']]
     fields, text, card = page['fields'], page['text'], detail['card']
@@ -74,6 +74,13 @@ def parse_detail(detail, snapshots, company_spec):
             raise ValueError('Extracted value is not a literal visible-DOM quote')
     if not company or (company not in text and company not in listing['text']):
         raise ValueError('Company name has no visible source evidence')
+    # 投递入口形态：站内 Easy Apply 与外部企业入口分开记录，都不自动提交。
+    if re.search(r'Easy\s*Apply|一键申请|立即申请', text, re.I) and 'linkedin' in (page['url'] or ''):
+        apply_type, apply_note = 'easy_apply', 'LinkedIn 站内 Easy Apply；需用户本人点击提交'
+    elif apply:
+        apply_type, apply_note = 'external', '原文给出投递入口；未点击、未提交'
+    else:
+        apply_type, apply_note = None, None
     complete = bool(len(description)>20 and len(requirements)>20)
     evidence = [Evidence(source_url=page['url'],retrieved_at=page['retrieved_at'],content_hash=page['content_hash'],
                          method='browser_visible_dom',snapshot='browser-run.json#'+page['id'],field_quotes=quotes)]
@@ -84,13 +91,19 @@ def parse_detail(detail, snapshots, company_spec):
     missing = [key for key,value in [('薪资',salary),('学历',education),('经验',experience),('工作地点',location)] if not value]
     if missing:
         notes.append('原文未明确披露：'+'、'.join(missing))
+    if channel == 'official_career':
+        source_type = 'official_website' if company_spec.get('source_type') == 'official_website' else 'recruitment_provider'
+    else:
+        source_type = 'platform'
     return Job(company=company,title=title,description=description,requirements=requirements or None,
-               source_url=page['url'],detail_url=page['url'],source_channel='official_career',source_id=source_id,
-               source_type='official_website' if company_spec.get('source_type')=='official_website' else 'recruitment_provider',
+               source_url=page['url'],detail_url=page['url'],source_channel=channel,source_id=source_id,
+               source_type=source_type,
                location_raw=location or None,locations=[location] if location else [],education_raw=education[0] if education else None,
                experience_raw=experience,salary_raw=salary[0] if salary else None,recruitment_type=detail.get('recruitment_type'),
                posted_at=posted,validity_checked_at=page['retrieved_at'],open_status='UNKNOWN',details_complete=complete,evidence=evidence,notes=notes,
-               application_url=page['url'] if apply else None,application_method='在原岗位页点击“'+apply[0]+'”；可能要求登录' if apply else None)
+               application_url=page['url'] if apply else None,
+               application_method=apply_note or ('在原岗位页点击“'+apply[0]+'”；可能要求登录' if apply else None),
+               apply_type=apply_type)
 
 
 def apply_role_reviews(jobs, reviews, config, snapshots):
@@ -107,11 +120,28 @@ def apply_role_reviews(jobs, reviews, config, snapshots):
         job.role_review={k:review[k] for k in ('role_keywords','decision','quote','content_hash','rationale')}
 
 
-def process_browser_run(config, input_path, output, resource_path=None, mode='real', role_reviews_path=None, run_id=None, workspace=None):
+BROWSER_RUNTIMES = ('codex_browser_visible_dom', 'jobfinder_local_browser')
+BROWSER_CHANNELS = ('official_career', 'linkedin', 'zhaopin', 'boss', 'liepin', '51job', 'campus_job',
+                    'bendibao_web', 'manual_import')
+
+
+def process_browser_run(config, input_path, output, resource_path=None, mode='real', role_reviews_path=None, run_id=None, workspace=None, channel=None):
+    """处理浏览器回执。
+
+    `channel` 必须显式给出（或由回执声明）：把领英/智联等平台回执套进官网处理器会把
+    来源写成 `official_career`，来源、预算与证据归属全错。
+    """
     input_path,output=Path(input_path),Path(output)
     receipt=json.loads(input_path.read_text(encoding='utf-8-sig'))
-    if receipt.get('schema_version')!='browser-run-1' or receipt.get('runtime')!='codex_browser_visible_dom':
+    if receipt.get('schema_version')!='browser-run-1' or receipt.get('runtime') not in BROWSER_RUNTIMES:
         raise ValueError('Unsupported browser receipt; manual imports use the existing import path')
+    channel = channel or receipt.get('source_channel') or 'official_career'
+    if channel not in BROWSER_CHANNELS:
+        raise ValueError('浏览器回执的 source_channel 不支持：'+str(channel))
+    from . import receipts as receipt_protocol
+    receipt_version = receipt.get('receipt_version') or receipt_protocol.V1
+    if receipt_version not in receipt_protocol.VERSIONS:
+        raise ValueError('浏览器回执的 receipt_version 不支持：'+str(receipt_version))
     if receipt.get('mode')!=mode:
         raise ValueError('Browser receipt mode mismatch')
     if receipt.get('plan',{}).get('config_fingerprint')!=fingerprint(config):
@@ -128,7 +158,7 @@ def process_browser_run(config, input_path, output, resource_path=None, mode='re
     errors=[]
     for d in receipt['details']:
         try:
-            job=parse_detail(d,snapshots,specs[d['company']])
+            job=parse_detail(d,snapshots,specs[d['company']],channel=channel)
             job.discovery_cities=list(config.target_cities)
             job.synthetic=mode=='test'
             jobs.append(job)
@@ -144,13 +174,14 @@ def process_browser_run(config, input_path, output, resource_path=None, mode='re
         own=[j for j in jobs if any(snapshots[e.snapshot.split('#')[-1]]['company']==c['company'] for e in j.evidence)]
         failed=[e for e in errors if e['company']==c['company']]
         complete=c.get('coverage_complete') is True and not failed
-        reports.append(dict(company=c['company'],channel='official_career',url=c['entry_url'],attempted=True,target_cities=config.target_cities,
+        reports.append(dict(company=c['company'],channel=channel,url=c['entry_url'],attempted=True,target_cities=config.target_cities,
                             access_status='success' if c['pages'] else 'failed',parse_status='success' if complete else 'partial',
                             jobs_extracted=len(own),reason='；'.join(c['problems']+[e['reason'] for e in failed]) or '声明范围读取完成；是否匹配按原始条件判断',
                             browser_status=c['status'],coverage_complete=complete,listed_count=len(c['listed']),reported_total=c.get('reported_total'),
                             detail_count=len(own),scope=c['scope'],full_detail_count=sum(j.details_complete for j in own)))
         companies.append({'legal_name':c['company'],'career_url':c['entry_url'],'verification_status':'browser_'+c['status'],'notes':c['scope']})
-    discovery={'provider':'codex_browser_visible_dom','status':'complete' if all(r['coverage_complete'] for r in reports) else 'partial',
+    discovery={'provider':receipt.get('runtime') or 'browser_visible_dom','channel':channel,
+               'receipt_version':receipt_version,'status':'complete' if all(r['coverage_complete'] for r in reports) else 'partial',
                'operation':'browser_collection','coverage':'；'.join(c['company']+'：'+c['scope'] for c in receipt['companies']),
                'candidates':[{'company':c['company'],'url':c['entry_url'],'candidate_type':'career_entry','target_cities':config.target_cities} for c in receipt['companies']],
                'search_log':[],'effective_config':effective_config(config,None,{}),
@@ -175,8 +206,9 @@ def process_browser_run(config, input_path, output, resource_path=None, mode='re
                 continue
             p=pages[-1]
             store.add(c['company'],p['url'],p['retrieved_at'],'entry_check',context={'entry':{
-                'url':c['entry_url'],'entry_type':'career_entry','source_type':specs[c['company']].get('source_type','recruitment_provider'),
-                'source_channel':'official_career','source_url':p['url'],'checked_at':p['retrieved_at'],
+                'url':c['entry_url'],'entry_type':'career_entry',
+                'source_type':('platform' if channel!='official_career' else specs[c['company']].get('source_type','recruitment_provider')),
+                'source_channel':channel,'source_url':p['url'],'checked_at':p['retrieved_at'],
                 'availability':'available' if c['pages'] else 'temporary_failure','reason':r['reason'],
                 'evidence':{'quote':p['text'][:1000],'content_hash':p['content_hash'],'method':'browser_visible_dom'},
                 'recommended_read_method':'browser_visible_dom'}})
@@ -188,7 +220,7 @@ def process_browser_run(config, input_path, output, resource_path=None, mode='re
                           supported=('hiring_history',),evidence={'quote':json.dumps(ev.field_quotes,ensure_ascii=False),'content_hash':ev.content_hash,
                           'entity_name':job.company,'kind':'job','subject_relation':'self'})
         store.snapshot()
-    write_report(output,payload,receipt)
+    write_report(output,payload,receipt,config)
     return payload
 
 
@@ -200,8 +232,9 @@ def browser_completion(config, reports, receipt, run_id=None, workspace=None):
         state = workflow.load_state(workspace, run_id)
         for report in reports:
             company = report.get('company')
+            report_channel = report.get('channel') or 'official_career'
             for task in state['tasks']:
-                if task['stage'] != 'official' or task.get('company') != company:
+                if task.get('channel') != report_channel or task.get('company') != company:
                     continue
                 if task['status'] in workflow.TASK_TERMINAL:
                     continue
@@ -242,14 +275,40 @@ def write_browser_audit(output,config,input_path,receipt,payload,role_reviews_pa
         (Path(output)/name).write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
 
 
-def write_report(output,payload,receipt):
+def condition_line(config):
+    """报告抬头的条件行必须来自本轮实际配置，不能写死。"""
+    from .spec import spec_for_config
+    spec = spec_for_config(config)
+    parts = ['、'.join(spec.target_locations)]
+    parts.append('、'.join(spec.job_scope.terms) if spec.job_scope.terms else '不限具体职位')
+    parts.append(spec.education_summary())
+    if spec.employment_types:
+        parts.append('、'.join(spec.employment_types))
+    return ' · '.join(p for p in parts if p)
+
+
+def write_report(output,payload,receipt,config=None):
     esc=lambda value:html.escape(str(value))
     rows=''.join('<tr>'+''.join('<td>'+esc(x)+'</td>' for x in [r['company'],r['listed_count'],r['detail_count'],r['full_detail_count'],r['coverage_complete'],r['scope'],r['reason']])+'</tr>' for r in payload['reports'])
     jobs=''.join('<tr>'+''.join('<td>'+esc(x)+'</td>' for x in [r['job']['company'],r['job']['title'],r['job'].get('location_raw'),r['status'],'；'.join(k+': '+v['reason'] for k,v in r['dimensions'].items() if v['state']!='PASS')])+'<td><a href="'+esc(r['job']['source_url'])+'">官网详情</a></td></tr>' for r in payload['results'])
-    page='''<!doctype html><meta charset="utf-8"><title>JobFinder 浏览器自动采集验收</title><style>body{font:16px system-ui;max-width:1400px;margin:35px auto;color:#173047;padding:0 24px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid #cbd5e1;padding:10px;text-align:left;vertical-align:top}th{background:#e8f0f8}a{color:#125da8}h1,h2{color:#173047}</style><h1>四家企业 · 浏览器自动采集</h1>'''
-    page+='<p>条件：广州 · 财务 BP · 本科及以上 · 社会招聘。时间：'+esc(payload['generated_at'])+'</p>'
-    page+='<p>自动采集脚本动作 '+str(len(receipt['events']))+'；可见 DOM 快照 '+str(len(receipt['snapshots']))+'（含重试，不含前期页面结构观察）；Python HTTP 请求 0。完整详情表示职责和要求已读，薪资/经验等未披露项仍留空；不等于岗位符合或仍开放。</p>'
-    page+='<p>匹配 '+str(payload['counts']['MATCH'])+'；待确认 '+str(payload['counts']['REVIEW'])+'；排除 '+str(payload['counts']['EXCLUDED'])+'。<a href="岗位汇总.xlsx">九列表格</a> · <a href="results.xlsx">工程核查表</a> · <a href="browser-run.json">浏览器证据与动作</a></p>'
+    summary_file = ((payload.get('discovery') or {}).get('summary_file') or '岗位汇总.xlsx')
+    column_count = len(SUMMARY_HEADERS)
+    title = f"{len(payload['reports'])} 家企业 · 浏览器可见 DOM 采集"
+    page = ('<!doctype html><meta charset="utf-8"><title>JobFinder 浏览器自动采集验收</title>'
+            '<style>body{font:16px system-ui;max-width:1400px;margin:35px auto;color:#173047;padding:0 24px}'
+            'table{border-collapse:collapse;width:100%;font-size:14px}'
+            'td,th{border:1px solid #cbd5e1;padding:10px;text-align:left;vertical-align:top}'
+            'th{background:#e8f0f8}a{color:#125da8}h1,h2{color:#173047}</style>'
+            '<h1>' + esc(title) + '</h1>')
+    conditions = condition_line(config) if config is not None else '未记录本轮条件'
+    page += '<p>条件：' + esc(conditions) + '。时间：' + esc(payload['generated_at']) + '</p>'
+    page += ('<p>自动采集脚本动作 ' + str(len(receipt['events'])) + '；可见 DOM 快照 '
+             + str(len(receipt['snapshots'])) + '（含重试，不含前期页面结构观察）；Python HTTP 请求 0。'
+             '完整详情表示职责和要求已读，薪资/经验等未披露项仍留空；不等于岗位符合或仍开放。</p>')
+    page += ('<p>匹配 ' + str(payload['counts']['MATCH']) + '；待确认 ' + str(payload['counts']['REVIEW'])
+             + '；排除 ' + str(payload['counts']['EXCLUDED'])
+             + '。<a href="' + esc(summary_file) + '">' + str(column_count) + ' 列表格</a> · '
+             '<a href="results.xlsx">工程核查表</a> · <a href="browser-run.json">浏览器证据与动作</a></p>')
     page+='<table><tr><th>企业</th><th>列表数</th><th>详情数</th><th>完整详情</th><th>范围完成</th><th>覆盖范围</th><th>问题</th></tr>'+rows+'</table><h2>详情与匹配结论</h2><table><tr><th>企业</th><th>岗位</th><th>地点</th><th>判定</th><th>原因</th><th>原文</th></tr>'+jobs+'</table>'
     page+='<h2>完整原文摘录</h2>'
     for job in payload['jobs']:

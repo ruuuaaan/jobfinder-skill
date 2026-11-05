@@ -8,115 +8,44 @@ close-stage / finalize`，以及 `new-search`、`process-browser`、`resume-trav
 匹配/导出函数，控制器无法阻止它；那种情况下产物里没有 `run_id` 与完成度区块，
 应被视为未经控制器验证的结果，而不是"已完成检索"。
 
+完成度粒度（workflow-1.2 起）
+----------------------------
+"渠道跑到尾"不是一个布尔值，而是**若干独立搜索范围**各自的结论。一个范围由
+`channel + city + query_scope + filter_fingerprint + pagination_chain_id` 组成：
+北京到底不代表深圳到底，岗位词 A 到底不代表 B 到底，分页链末页只关闭该链。
+`COMPLETE` 只表示"本轮声明范围完成"，从不表示"该网站全部岗位已查尽"。
+
 数据只写入 `<workspace>/data/runs/<run_id>/`，不写技能安装目录。
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import budgets, receipts
+from . import channels as channel_registry
 from .models import now, SHANGHAI
 
-PROTOCOL_VERSION = "workflow-1.1"
+PROTOCOL_VERSION = "workflow-1.2"
+STATE_SCHEMA = "workflow-run-2"
 
-# 全局阶段顺序：官网 → 招聘平台 → 本地宝网站 → 公众号。
-# 同一阶段内可以按预算轮转城市/平台/任务；跨阶段不得抢跑。
-STAGES = ("official", "recruitment", "campus", "bendibao_web", "public_accounts")
-STAGE_LABELS = {
-    "official": "企业官网",
-    "recruitment": "招聘平台",
-    "campus": "高校就业网",
-    "bendibao_web": "本地宝网站",
-    "public_accounts": "公众号",
-}
-CHANNEL_STAGE = {
-    "official_career": "official",
-    "public_recruitment": "official",
-    "zhaopin": "recruitment",
-    "boss": "recruitment",
-    "liepin": "recruitment",
-    "51job": "recruitment",
-    "linkedin": "recruitment",
-    "campus_job": "campus",
-    "bendibao_web": "bendibao_web",
-    "bendibao_wechat": "public_accounts",
-}
-# 需要用户可见浏览器登录交接的渠道（站内搜索与登录态详情必须走这条前置）。
-PLATFORM_CHANNELS = ("zhaopin", "boss", "liepin", "51job", "linkedin")
-# 非检索类渠道：不进入阶段任务簿，只表示人工材料来源。
-NON_STAGE_CHANNELS = ("manual_import",)
+STAGES = channel_registry.STAGE_ORDER
+STAGE_LABELS = channel_registry.STAGE_LABELS
+CHANNEL_STAGE = {c.name: c.stage for c in channel_registry.CHANNELS if c.stage != "none"}
+PLATFORM_CHANNELS = channel_registry.PLATFORM
+NON_STAGE_CHANNELS = channel_registry.NON_STAGE
 
-# 必须声明"检索是否到底"的路由：任何一条成功回执都要给 exhausted。
-# 未声明 → 直接拒绝；声明 false 且预算仍有剩余 → 阶段不许关闭，必须继续翻页/换词。
 EXHAUSTION_ROUTES = ("direct", "research", "browse_list", "channel_search")
-# 官网发现类路由：产出的每一条企业线索都必须转成官网核实任务，或给出不可核实的书面理由。
 DISCOVERY_ROUTES = ("direct", "research")
 VERIFY_ROUTE = "official_verify"
+ENTRY_ROUTES = ("enterprise", "entry_reuse", "announcement_reverse", "enterprise_fallback")
 
-# 渠道菜单：技能实际支持的检索渠道及其能力差异。agent 必须把这张表呈现给用户选择，
-# 不能只按配置文件里的 sources 悄悄决定跑哪些渠道。
-CHANNEL_INFO = {
-    "official_career": {"label": "企业官网", "stage": "official",
-                        "note": "查询词/研究检索 → 企业名单 → 逐家官网核实；最慢但能拿 JD 原文"},
-    "51job": {"label": "前程无忧", "stage": "recruitment",
-              "note": "职能分类页直读为主，需登录核验"},
-    "zhaopin": {"label": "智联招聘", "stage": "recruitment",
-                "note": "站内搜索；未登录时薪资显示「-元」"},
-    "boss": {"label": "BOSS直聘", "stage": "recruitment",
-             "note": "核心无授权接口，只能由宿主可见浏览器读取"},
-    "liepin": {"label": "猎聘", "stage": "recruitment",
-               "note": "站内搜索/城市聚合页，需登录"},
-    "linkedin": {"label": "领英", "stage": "recruitment",
-                 "note": "未实测；需宿主显式授权后才能读取"},
-    "bendibao_web": {"label": "本地宝网站", "stage": "bendibao_web",
-                     "note": "偏国企/事业单位/基层岗位，需先确认站点入口"},
-    "campus_job": {"label": "高校就业网", "stage": "campus",
-                   "note": "学校就业网/学生就业创业服务网，校招与应届岗为主；需逐校站内检索"},
-    "bendibao_web": {"label": "本地宝网站", "stage": "bendibao_web",
-                     "note": "偏国企/事业单位/基层岗位，需先确认站点入口"},
-    "bendibao_wechat": {"label": "本地宝公众号", "stage": "public_accounts",
-                        "note": "拿不到后台列表，只能检索可见内容，覆盖不完整"},
-}
-SUPPORTED_CHANNELS = ("official_career", "51job", "zhaopin", "boss", "liepin",
-                      "campus_job", "bendibao_web", "bendibao_wechat")
-
-
-def channel_menu(config=None):
-    """返回按阶段分组的渠道菜单，供 agent 原样展示给用户勾选。"""
-    configured = list(getattr(config, "sources", []) or []) if config is not None else []
-    rows = []
-    for stage in STAGES:
-        channels = [{"channel": c, "label": CHANNEL_INFO[c]["label"], "note": CHANNEL_INFO[c]["note"],
-                     "in_config": (c in configured) if configured else None}
-                    for c in SUPPORTED_CHANNELS if CHANNEL_INFO[c]["stage"] == stage]
-        if channels:
-            rows.append({"stage": stage, "label": STAGE_LABELS[stage], "channels": channels})
-    return {
-        "protocol_version": PROTOCOL_VERSION,
-        "stage_order": list(STAGES),
-        "menu": rows,
-        "config_channels": configured,
-        "guidance": "必须先让用户勾选渠道，再把选中的 --channel 传给 start-run；"
-                    "不要依据配置文件静默决定范围。用户全选时可用 --all-channels。",
-    }
-
-
-def resolve_channel_selection(channels, all_channels=False):
-    """ CLI/客户端选择归一化：必须显式给出选择，不能为空。"""
-    if all_channels:
-        return list(SUPPORTED_CHANNELS), True
-    picked = list(dict.fromkeys(channels or []))
-    if not picked:
-        raise ValueError("必须显式选择渠道：请先展示渠道菜单，再把用户勾选结果传给 --channel（或 --all-channels）")
-    unknown = [c for c in picked if c not in CHANNEL_INFO]
-    if unknown:
-        raise ValueError("不支持的渠道：" + "、".join(unknown) +
-                         "；可选：" + "、".join(SUPPORTED_CHANNELS))
-    return picked, False
+CHANNEL_INFO = {c.name: {"label": c.label, "stage": c.stage, "note": c.note}
+                for c in channel_registry.CHANNELS if c.supported}
+SUPPORTED_CHANNELS = channel_registry.SUPPORTED
 
 TASK_TERMINAL = ("executed", "blocked", "skipped_by_user", "budget_exhausted")
 MAX_TASK_ATTEMPTS = 2
@@ -139,16 +68,11 @@ def channel_stage(channel):
     return CHANNEL_STAGE.get(channel, "recruitment")
 
 
-def stage_order(channels, *, user_selected=False):
-    """本轮实际阶段顺序。
-
-    默认四类渠道齐全时就是全局顺序；用户明确只选部分渠道时按所选渠道裁剪，
-    不强行补回未选渠道（也不静默改变旧任务的渠道范围）。
-    """
-    present = {channel_stage(c) for c in channels if c not in NON_STAGE_CHANNELS}
+def stage_order(channels_, *, user_selected=False):
+    """本轮实际阶段顺序；只按所选渠道裁剪，不强行补回未选渠道。"""
+    present = {channel_stage(c) for c in channels_ if c not in NON_STAGE_CHANNELS}
     order = [s for s in STAGES if s in present]
     if not order:
-        # 只有人工导入等非检索渠道时，官网阶段仍保留，用于读取用户提供的链接。
         order = ["official"]
     return order
 
@@ -161,29 +85,153 @@ def state_file(workspace, run_id):
     return run_root(workspace) / run_id / "state.json"
 
 
+def channel_menu(config=None):
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "stage_order": list(STAGES),
+        "menu": channel_registry.menu(config),
+        "config_channels": list(getattr(config, "sources", []) or []) if config is not None else [],
+        "guidance": "必须先让用户勾选渠道，再把选中的 --channel 传给 start-run；"
+                    "不要依据配置文件静默决定范围。用户全选时可用 --all-channels。",
+    }
+
+
+def resolve_channel_selection(channels_, all_channels=False):
+    return channel_registry.resolve_selection(channels_, all_channels)
+
+
+# ---------------------------------------------------------------- 完成度范围
+
+def _norm_scope(value) -> str:
+    import re
+    text = re.sub(r"\s+", "", str(value or "")).casefold()
+    return text
+
+
+def filter_fingerprint(task) -> str:
+    """查询条件指纹：同范围内的翻页继承同一指纹，不同筛选/口径自然分开。"""
+    payload = {
+        "route": task.get("route"),
+        "browse_url": task.get("browse_url"),
+        "covers": sorted(task.get("covers_roles") or []),
+        "access_kind": budgets.kind_for(task.get("route")),
+        "channel": task.get("channel"),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False)
+                          .encode("utf-8")).hexdigest()[:16]
+
+
+def scope_of(task) -> dict:
+    query_scope = task.get("query_scope")
+    if query_scope is None:
+        query_scope = task.get("role_keyword") or ",".join(task.get("covers_roles") or [])
+    chain = task.get("pagination_chain_id")
+    if chain is None:
+        chain = task.get("browse_url") or task.get("task_id")
+    return {
+        "channel": task.get("channel"),
+        "city": task.get("target_city"),
+        "query_scope": _norm_scope(query_scope),
+        "filter_fingerprint": task.get("filter_fingerprint") or filter_fingerprint(task),
+        "pagination_chain_id": chain or task.get("task_id"),
+    }
+
+
+def scope_key(task) -> str:
+    scope = scope_of(task)
+    return "|".join(str(scope[k]) for k in ("channel", "city", "query_scope",
+                                            "filter_fingerprint", "pagination_chain_id"))
+
+
+def _scopes(state, stage=None) -> dict:
+    out: dict[str, dict] = {}
+    for task in state["tasks"]:
+        if stage and task.get("stage") != stage:
+            continue
+        if task.get("skipped_stage") or task.get("stage") == "skipped":
+            continue
+        key = scope_key(task)
+        row = out.setdefault(key, {"key": key, **scope_of(task), "tasks": [],
+                                   "exhausted": False, "executed": 0, "gap": None})
+        row["tasks"].append(task)
+        if task.get("exhausted") is True:
+            row["exhausted"] = True
+        if task.get("status") in ("executed", "budget_exhausted"):
+            row["executed"] += 1
+    return out
+
+
+def open_scopes(state, stage=None) -> list[dict]:
+    """已执行但没声明到底、预算仍有剩余、且没有后续任务承接的范围。"""
+    out = []
+    for key, row in _scopes(state, stage).items():
+        if row["exhausted"] or not row["executed"]:
+            continue
+        live = [t for t in row["tasks"] if t.get("status") not in TASK_TERMINAL]
+        if live:
+            continue
+        declared_false = [t for t in row["tasks"]
+                          if t.get("status") == "executed" and t.get("exhausted") is False]
+        continued = [t for t in row["tasks"] if t.get("continued")]
+        if not declared_false or continued:
+            continue
+        remaining = task_budget_remaining(state, declared_false[0])
+        if remaining == 0:
+            row["gap"] = "budget_exhausted"
+            continue
+        out.append(row)
+    return out
+
+
+def exhausted_scope_keys(state, stage=None) -> set:
+    return {k for k, row in _scopes(state, stage).items() if row["exhausted"]}
+
+
+def scope_completion(state, stage=None) -> list[dict]:
+    rows = []
+    for key, row in _scopes(state, stage).items():
+        remaining = None
+        first = row["tasks"][0] if row["tasks"] else None
+        if first:
+            remaining = task_budget_remaining(state, first)
+        rows.append({"key": key, "channel": row["channel"], "city": row["city"],
+                     "query_scope": row["query_scope"],
+                     "pagination_chain_id": row["pagination_chain_id"],
+                     "exhausted": row["exhausted"], "executed": row["executed"],
+                     "budget_remaining": remaining,
+                     "status": ("exhausted" if row["exhausted"] else
+                                "budget_limited" if remaining == 0 else
+                                "open" if remaining is None or remaining > 0 else "unknown")})
+    return rows
+
+
 # ---------------------------------------------------------------- 创建运行
 
 def start_run(config, plan, workspace, *, channels=None, public_only=False,
               auth_policy=None, run_id=None, budget_used=None, previous_run=None,
-              user_confirmed_scope=False):
+              user_confirmed_scope=False, browser_surface=None):
     """冻结本轮执行范围并落盘。
 
-    `channels` 必须是配置里的渠道子集；不传则取配置渠道。
-    `public_only=True` 是显式的匿名读取模式（platform_auth_policy=public_only），
-    只能由用户选择，控制器不会因为"图方便"自动降级。
+    `user_confirmed_scope` 只表示**用户明确只要当前渠道范围**；助手自行少选渠道时
+    不得传 True，否则完成度会把"少跑了"记成"用户要求的范围"。
+    `browser_surface`：`external`（用户本机独立浏览器，平台渠道默认）/ `embedded`（显式选择）。
     """
-    if plan.get("config_fingerprint") != _plan_fingerprint(plan):
-        pass  # 计划自带指纹，配置一致性由 new-search 复核，这里不重复计算
-    scope = list(dict.fromkeys(channels or plan.get("channels") or plan.get("effective_config", {}).get("sources", [])))
+    scope = list(dict.fromkeys(channels or plan.get("channels")
+                               or plan.get("effective_config", {}).get("sources", [])))
     unknown = [c for c in scope if c not in NON_STAGE_CHANNELS and c not in CHANNEL_STAGE]
     if unknown:
-        raise ValueError("未建模的渠道：" + "、".join(unknown) + "；请在 CHANNEL_STAGE 中显式建模后再启用")
+        raise ValueError("未建模的渠道：" + "、".join(unknown) +
+                         "；请在 channel_registry.py 中显式建模后再启用")
     if public_only:
         policy = "public_only"
     else:
         policy = auth_policy or "required"
     if policy not in ("required", "public_only"):
         raise ValueError("platform_auth_policy 只能是 required 或 public_only")
+    needs_external = any(channel_registry.browser_surface(c) == "external" for c in scope)
+    surface = browser_surface or ("external" if needs_external and policy == "required" else "embedded")
+    if surface not in ("external", "embedded"):
+        raise ValueError("browser_surface 只能是 external 或 embedded")
 
     plan_tasks = [_task_from_plan(t, scope) for t in plan.get("tasks", [])]
     plan_tasks = [t for t in plan_tasks if t["stage"] != "skipped"]
@@ -192,11 +240,14 @@ def start_run(config, plan, workspace, *, channels=None, public_only=False,
     entry_tasks = [t for t in entry_tasks if t["stage"] != "skipped"]
 
     run_id = run_id or "run-" + uuid.uuid4().hex[:12]
+    order = stage_order(scope)
     state = {
-        "schema_version": "workflow-run-1",
+        "schema_version": STATE_SCHEMA,
         "protocol_version": PROTOCOL_VERSION,
+        "receipt_protocol": plan.get("receipt_protocol") or receipts.V2,
         "run_id": run_id,
         "created_at": now(),
+        "started_at": now(),
         "updated_at": now(),
         "plan_id": plan.get("plan_id"),
         "plan_version": plan.get("schema_version") or plan.get("plan_version") or "plan-1",
@@ -206,12 +257,13 @@ def start_run(config, plan, workspace, *, channels=None, public_only=False,
             "cities": list(plan.get("effective_config", {}).get("target_cities") or []),
             "roles": list(plan.get("effective_config", {}).get("role_keywords") or []),
             "channels": scope,
-            "stage_order": stage_order(scope),
+            "stage_order": order,
             "platform_auth_policy": policy,
+            "browser_surface": surface,
             "user_scope_explicit": bool(channels),
         },
-        "current_stage": stage_order(scope)[0],
-        "stages": {s: {"status": "pending", "closed_at": None, "reason": None} for s in stage_order(scope)},
+        "current_stage": order[0],
+        "stages": {s: {"status": "pending", "closed_at": None, "reason": None} for s in order},
         "tasks": plan_tasks + entry_tasks,
         "auth": {},
         "budget_used": budget_used or {},
@@ -221,35 +273,77 @@ def start_run(config, plan, workspace, *, channels=None, public_only=False,
         "previous_run": previous_run,
         "platform_auth_required": policy == "required",
     }
-    # 预算上限冻结进运行状态：后续判断"还能不能继续搜"只认这里的值。
-    plan_budget = (plan.get("effective_config") or {}).get("budget") or {}
-    state["scope"]["budget"] = {"searches_per_city": plan_budget.get("searches_per_city"),
-                                "companies_per_city": plan_budget.get("companies_per_city"),
-                                "per_channel": dict(plan_budget.get("per_channel") or {})}
+    # 预算上限冻结进运行状态：派发、回执、恢复、收尾都只认这里的值。
+    state["scope"]["budget"] = budgets.freeze(plan, plan.get("budget_profile"))
     # 范围覆盖度：只覆盖部分阶段时，必须区分"用户明确只要这些"与"助手自行收窄"。
-    covered = set(state["scope"]["stage_order"])
+    covered = set(order)
     missing = [s for s in STAGES if s not in covered]
     state["scope"]["covered_stages"] = sorted(covered)
     state["scope"]["missing_stages"] = missing
-    state["scope"]["user_scope_confirmed"] = bool(user_confirmed_scope)
+    state["scope"]["user_scope_confirmed"] = bool(user_confirmed_scope and channels)
+    state["scope"]["narrowed_by"] = ("user" if state["scope"]["user_scope_confirmed"]
+                                     else "agent" if missing else "none")
     if missing:
         state["scope"]["coverage"] = "partial_scope"
         state["scope_adjustments"].append({
             "kind": "narrowed_scope", "missing_stages": missing,
-            "user_confirmed": bool(user_confirmed_scope), "at": now()})
+            "user_confirmed": state["scope"]["user_scope_confirmed"],
+            "narrowed_by": state["scope"]["narrowed_by"], "at": now()})
     else:
         state["scope"]["coverage"] = "full_scope"
-    state["updated_at"] = now()
-    save_state(state, workspace)
+    # 平台访问状态（冷却/受限）来自磁盘，跨 run 保留；不因新建 run 自动清除。
+    try:
+        from . import access_control
+        state["platform_state"] = {
+            c: view for c in scope
+            if (view := access_control.cooldown(workspace, c))
+        }
+    except Exception:
+        state["platform_state"] = {}
+    # 浏览器能力来自实际探测，不接受模型自述。
+    state["browser"] = _detect_browser(workspace)
+    state["access"] = {"receipt_protocol": state["receipt_protocol"],
+                       "browser_surface": surface,
+                       "linkedin_mode": channel_registry.access_mode("linkedin")}
     _append_event(state, {"kind": "start_run", "plan_id": state["plan_id"],
-                          "channels": scope, "stage_order": state["scope"]["stage_order"],
-                          "auth_policy": policy})
+                          "channels": scope, "stage_order": order, "auth_policy": policy,
+                          "browser_surface": surface,
+                          "user_scope_confirmed": state["scope"]["user_scope_confirmed"],
+                          "narrowed_by": state["scope"]["narrowed_by"]})
     save_state(state, workspace)
     return state
 
 
-def _plan_fingerprint(plan):
-    return plan.get("config_fingerprint")
+def refresh_browser_state(state, workspace) -> dict:
+    """用实际探测刷新浏览器会话信息。
+
+    只读探测（service.json + 端口 + pid），不会启动浏览器。用于 next-action 之类
+    的"下一步判断"：浏览器被关掉后应立刻显示需要重新打开，而不是继续显示旧会话。
+    """
+    detected = _detect_browser(workspace)
+    state["browser"] = detected
+    for channel in state.get("scope", {}).get("channels", []):
+        record = (state.get("auth") or {}).get(channel) or {}
+        if not record.get("backend_session_id"):
+            continue
+        if detected.get("status") == "unavailable":
+            record["status"] = "blocked"
+            record["reason"] = detected.get("reason")
+        elif detected.get("session_id") and record.get("backend_session_id") \
+                and detected["session_id"] != record["backend_session_id"]:
+            record["status"] = "invalidated"
+            record["reason"] = "浏览器会话已重建（进程或配置目录变化），需要重新核验登录"
+    return detected
+
+
+def _detect_browser(workspace) -> dict:
+    try:
+        from .browser_backend import capability_report
+        return capability_report(workspace)
+    except Exception as exc:  # 探测失败不能变成"能力可用"
+        return {"backend": "external_browser", "status": "unsupported",
+                "installed": [], "capabilities": {}, "reason": f"浏览器能力探测失败：{exc}",
+                "requires_local_connector": True, "detected_by": "error"}
 
 
 def _task_from_plan(task, scope, derived_from=None):
@@ -278,7 +372,13 @@ def _task_from_plan(task, scope, derived_from=None):
         "browse_url": task.get("browse_url"),
         "covers_roles": task.get("covers_roles"),
         "skipped_stage": not included,
+        "exhausted": None,
     }
+    row["query_scope"] = task.get("query_scope") or task.get("role_keyword") \
+        or ",".join(task.get("covers_roles") or [])
+    row["filter_fingerprint"] = task.get("filter_fingerprint") or filter_fingerprint(row)
+    row["pagination_chain_id"] = (task.get("pagination_chain_id") or task.get("browse_url")
+                                  or task["task_id"])
     if not included:
         row["stage"] = "skipped"
     return row
@@ -304,7 +404,51 @@ def load_state(workspace, run_id):
     path = state_file(workspace, run_id)
     if not path.exists():
         raise ValueError(f"运行 {run_id} 不存在；请先 start-run")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return upgrade_state(json.loads(path.read_text(encoding="utf-8")), workspace)
+
+
+def upgrade_state(state, workspace=None):
+    """旧运行记录只补齐缺的字段，不改写历史条件、证据时间与配置指纹。"""
+    version = state.get("schema_version")
+    if version == STATE_SCHEMA:
+        return state
+    state.setdefault("schema_version", STATE_SCHEMA)
+    state.setdefault("created_at", state.get("updated_at") or now())
+    state.setdefault("started_at", state.get("created_at"))
+    # 旧运行没有记录回执协议：显式标成 receipt-1，历史上缺失的 exhausted 仍按未验证处理。
+    state.setdefault("receipt_protocol", receipts.V1)
+    state.setdefault("auth", {})
+    state.setdefault("budget_used", {})
+    state.setdefault("derived_tasks", [])
+    state.setdefault("scope_adjustments", [])
+    state.setdefault("events", [])
+    state.setdefault("platform_state", {})
+    scope = state.setdefault("scope", {})
+    scope.setdefault("browser_surface", "embedded")
+    scope.setdefault("user_scope_confirmed", False)
+    scope.setdefault("narrowed_by", "unknown")
+    budget = scope.setdefault("budget", {})
+    budget.setdefault("per_city", {})
+    budget.setdefault("per_channel", {})
+    budget.setdefault("per_city_channel", {})
+    budget.setdefault("searches_per_city", None)
+    for task in state.get("tasks", []):
+        task.setdefault("exhausted", None)
+        task.setdefault("query_scope", task.get("role_keyword"))
+        task.setdefault("filter_fingerprint", filter_fingerprint(task))
+        task.setdefault("pagination_chain_id", task.get("browse_url") or task.get("task_id"))
+    state["upgraded_from"] = version
+    state["upgraded_at"] = now()
+    if workspace:
+        try:
+            from . import access_control
+            for channel in scope.get("channels", []):
+                view = access_control.cooldown(workspace, channel)
+                if view:
+                    state["platform_state"][channel] = view
+        except Exception:
+            pass
+    return state
 
 
 def latest_run_id(workspace):
@@ -338,7 +482,7 @@ def _auth_record(state, channel):
 
 
 def auth_status(state, channel):
-    """登录核验状态：只有同一 run、同一渠道、未过期且证据有效的记录才算通过。"""
+    """登录核验状态：只有同一 run、同一渠道、未过期、会话仍有效且证据有效的记录才算通过。"""
     if state.get("scope", {}).get("platform_auth_policy") == "public_only":
         return "public_only"
     record = _auth_record(state, channel)
@@ -355,15 +499,15 @@ def auth_status(state, channel):
         return "expired"
     if record.get("run_id") != state.get("run_id") or record.get("channel") != channel:
         return "mismatch"
+    current = (state.get("browser") or {}).get("session_id")
+    if current and record.get("backend_session_id") and current != record["backend_session_id"]:
+        # 浏览器重建/重开 = 原会话失效，必须重新核验。
+        return "invalidated"
     return "verified"
 
 
 def pending_auth_channels(state, stage=None):
-    """当前阶段里还缺登录核验的平台渠道。
-
-    进入招聘平台阶段时应**一次性**把这些平台的登录页都打开交给用户，
-    而不是执行一条任务弹一个，让用户反复切标签页。
-    """
+    """当前阶段里还缺登录核验的平台渠道（一次性打开，不逐条弹窗）。"""
     stage = stage or state.get("current_stage")
     out = []
     for channel in state["scope"]["channels"]:
@@ -376,15 +520,19 @@ def pending_auth_channels(state, stage=None):
         if status == "verified":
             continue
         record = _auth_record(state, channel) or {}
-        out.append({"channel": channel, "label": CHANNEL_INFO.get(channel, {}).get("label", channel),
+        out.append({"channel": channel, "label": channel_registry.label(channel),
                     "login_url": login_url(channel), "auth_status": status,
-                    "tab_id": record.get("tab_id"), "browser_context_id": record.get("browser_context_id"),
-                    "opened": status in ("waiting_user", "failed", "expired")})
+                    "access_mode": channel_registry.access_mode(channel),
+                    "automation_allowed": channel_registry.automation_allowed(channel),
+                    "browser_surface": (state.get("scope") or {}).get("browser_surface"),
+                    "browser_status": (state.get("browser") or {}).get("status"),
+                    "tab_id": record.get("tab_id"),
+                    "browser_session_id": record.get("backend_session_id"),
+                    "opened": bool((record.get("opened_event") or {}).get("backend_session_id"))})
     return out
 
 
 def _channel_needs_auth(state, channel):
-    """该渠道此刻是否需要先完成登录核验（只作用于任务自身的平台）。"""
     if channel not in PLATFORM_CHANNELS:
         return False
     if state.get("scope", {}).get("platform_auth_policy") == "public_only":
@@ -396,75 +544,59 @@ def _platform_auth_blocked_by_policy(state, channel):
     return state.get("scope", {}).get("platform_auth_policy") == "public_only"
 
 
-# ---------------------------------------------------------------- 下一动作
+def platform_gate(state, channel):
+    """平台当前是否可访问：冷却/受限/能力缺口都返回结构化原因。"""
+    view = (state.get("platform_state") or {}).get(channel)
+    if view:
+        return view
+    browser = state.get("browser") or {}
+    if (state.get("scope") or {}).get("browser_surface") == "external" \
+            and channel in PLATFORM_CHANNELS and browser.get("status") == "unavailable":
+        return {"state": "capability_gap", "reason": browser.get("reason"),
+                "requires_local_connector": browser.get("requires_local_connector", True)}
+    return None
+
+
+# ---------------------------------------------------------------- 预算（统一口径）
 
 def channel_budget_cap(state, channel):
-    """该渠道本轮配额；没配 per_channel 时退回城市单池上限。"""
-    budget = state.get("scope", {}).get("budget") or {}
-    per_channel = budget.get("per_channel") or {}
-    if channel in per_channel:
-        return int(per_channel[channel])
-    return budget.get("searches_per_city")
+    return budgets.cap((state.get("scope") or {}).get("budget") or {}, channel, None)
 
 
 def channel_budget_used(state, channel, city):
-    used = (state.get("budget_used") or {}).get("by_channel", {}).get(channel, {}) or {}
-    return int(used.get(city, 0))
+    return budgets.used(state, channel, city)
 
 
 def channel_budget_remaining(state, channel, city):
-    cap = channel_budget_cap(state, channel)
-    if cap is None:
-        return None
-    return max(0, cap - channel_budget_used(state, channel, city))
+    return budgets.channel_remaining(state, channel, city)
 
 
 def budget_remaining(state, city):
-    """全轮还能搜几次；None 表示计划未设上限。
+    """全轮还能执行多少次任务；None 表示计划未设上限。"""
+    return budgets.total_remaining(state, city)
 
-    配了 per_channel 时返回各渠道剩余额度之和：渠道之间各花各的，不再互相抢。
-    """
-    per_channel = (state.get("scope", {}).get("budget") or {}).get("per_channel") or {}
-    if per_channel:
-        total = 0
-        for channel, cap in per_channel.items():
-            total += max(0, int(cap) - channel_budget_used(state, channel, city))
-        return total
-    cap = (state.get("scope", {}).get("budget") or {}).get("searches_per_city")
-    if cap is None:
+
+def stage_budget_remaining(state, stage, city):
+    """阶段口径剩余，仅用于报告（不再作为第二道门）。"""
+    return budgets.stage_remaining(state, stage, city)
+
+
+def task_budget_remaining(state, task):
+    """该任务还能不能执行：渠道配额与计量类型上限取更严的一个。"""
+    city = task.get("target_city")
+    channel = task.get("channel")
+    values = [budgets.channel_remaining(state, channel, city)]
+    kind = budgets.kind_for(task.get("route"))
+    if kind != budgets.SEARCH:
+        values.append(budgets.kind_remaining(state, kind, city))
+    known = [v for v in values if v is not None]
+    if not known:
         return None
-    used = (state.get("budget_used") or {}).get("searches", {}).get(city, 0)
-    return max(0, int(cap) - int(used))
+    return min(known)
 
 
 def _incomplete_searches(state, stage):
-    """已执行、但没声明"检索到底"而预算又没用完的任务。
-
-    这些任务意味着渠道没跑完：既不能关阶段，也不能靠"任务 executed"混过去。
-    """
-    out = []
-    # 同一渠道只要有一条任务声明"检索到底"，就代表该渠道整体跑到尾了，
-    # 前面几页不用再各自声明（否则翻到最后一页也永远关不掉）。
-    done_channels = {t["channel"] for t in _stage_tasks(state, stage) if t.get("exhausted") is True}
-    for task in _stage_tasks(state, stage):
-        if task["status"] != "executed":
-            continue
-        if task["route"] not in EXHAUSTION_ROUTES:
-            continue
-        if task["channel"] in done_channels:
-            continue
-        if task.get("exhausted") is not False or task.get("continued"):
-            continue
-        if channel_budget_remaining(state, task["channel"], task.get("target_city")) == 0:
-            continue
-        # 同渠道同阶段已经排着后续页/后续任务时，进度由那些任务承接，不重复要派生。
-        queued = [t for t in _stage_tasks(state, task["stage"])
-                  if t["task_id"] != task["task_id"] and t["channel"] == task["channel"]
-                  and t["status"] not in TASK_TERMINAL]
-        if queued:
-            continue
-        out.append(task)
-    return out
+    return [row["tasks"][0] for row in open_scopes(state, stage)]
 
 
 def derived_gaps(state, stage=None):
@@ -492,23 +624,20 @@ def next_action(state):
     if state.get("finished"):
         return {"action": "finished", "verdict": state.get("completion", {}).get("verdict")}
 
-    # 0. 本阶段还有可执行任务时先执行它们：一个渠道没翻完不该让其他平台干等。
-    #    只有"本阶段没有 pending 任务"时，才轮到下面两道收尾闸门。
     pending_task = _next_task(state, stage) if stage else None
     open_work = _incomplete_searches(state, stage) if stage and not pending_task else []
     lead_gaps = derived_gaps(state, stage) if stage and not pending_task else []
 
-    # 0a. 渠道没搜到底、预算又还有：必须先继续，不能拿"任务已执行"关阶段。
     if open_work:
         task = open_work[0]
         return {"action": "continue_channel", "run_id": state["run_id"], "stage": stage,
                 "task_id": task["task_id"], "channel": task["channel"], "route": task["route"],
-                "budget_remaining": budget_remaining(state, task.get("target_city")),
-                "message": ("该渠道的检索未声明到底，且搜索预算仍有剩余：如还有下一页/下一批结果，"
+                "scope": scope_of(task),
+                "budget_remaining": task_budget_remaining(state, task),
+                "message": ("该搜索范围还没声明到底，且预算仍有剩余：如还有下一页/下一批结果，"
                             "用 action=register_derived 派生后续页任务并继续；若确实已到底，"
-                            "重新提交该任务回执并带上 exhausted=true")}
+                            "重新提交该任务回执并带上 exhausted=true（补证据属于修订，不重复计次）")}
 
-    # 0b. 官网发现的企业线索必须逐家核实，没登记就不许往下走。
     if lead_gaps:
         gap = lead_gaps[0]
         return {"action": "register_derived", "run_id": state["run_id"], "stage": stage,
@@ -529,8 +658,6 @@ def next_action(state):
         stage = nxt
         state["current_stage"] = stage
 
-    # 0. 官网阶段后来派生出的任务（official-plan / extend-plan / 后续计划）必须回到官网阶段处理，
-    #    不能被追加到招聘平台之后。这里把游标退回去并标记 reopened。
     earlier = [s for s in order[:order.index(stage)]
                if any(t["stage"] == s and t["status"] not in TASK_TERMINAL for t in state["tasks"])]
     if earlier:
@@ -541,38 +668,111 @@ def next_action(state):
         _append_event(state, {"kind": "reopen_stage", "stage": target})
         stage = target
 
-    # 1. 当前阶段的可执行任务（含官网派生的企业核实任务）。
     task = _next_task(state, stage)
-    # 2. 登录前置绑定到**具体任务所在平台**：一个平台未登录不应阻塞同阶段其他平台。
-    if task and _channel_needs_auth(state, task["channel"]):
-        channel = task["channel"]
-        record = _auth_record(state, channel) or {}
-        if record.get("status") == "waiting_user":
-            return {"action": "wait_user_auth", "run_id": state["run_id"], "stage": stage,
-                    "channel": channel, "task_id": task["task_id"], "tab_id": record.get("tab_id"),
-                    "browser_context_id": record.get("browser_context_id"),
-                    "login_url": record.get("login_url"),
-                    "message": "已打开登录入口，等待用户在同一浏览器会话完成登录后提交核验"}
-        if record.get("status") == "blocked":
-            return {"action": "channel_blocked", "run_id": state["run_id"], "stage": stage,
-                    "channel": channel, "reason": record.get("reason"),
-                    "message": "该平台登录受阻；记录原因后可跳过该平台，其余工作继续"}
-        return {"action": "open_auth_tab", "run_id": state["run_id"], "stage": stage,
-                "channel": channel, "task_id": task["task_id"], "login_url": login_url(channel),
-                "message": "该平台的业务搜索前先打开页面并核验当前会话；未登录则交给用户登录"}
+    if task:
+        gate = platform_gate(state, task["channel"])
+        if gate and gate.get("state") == "capability_gap":
+            return {"action": "capability_gap", "run_id": state["run_id"], "stage": stage,
+                    "channel": task["channel"], "task_id": task["task_id"],
+                    "requires_local_connector": gate.get("requires_local_connector"),
+                    "reason": gate.get("reason"),
+                    "message": ("本轮要求用户本机独立浏览器，但本机探测不到可用浏览器；"
+                                "不会回退到 agent 内嵌预览。请在本机安装 Chrome/Edge 或提供本机连接程序，"
+                                "记录能力缺口后继续其他渠道")}
+        if gate and gate.get("state") in ("cooling", "blocked"):
+            return {"action": "channel_blocked" if gate["state"] == "blocked" else "channel_cooling",
+                    "run_id": state["run_id"], "stage": stage, "channel": task["channel"],
+                    "until": gate.get("until"), "reason": gate.get("reason"),
+                    "message": ("该平台处于冷却/受限状态（跨 run 保留）：按阶段规则推进其他可访问渠道，"
+                                "到期或用户显式重试后再恢复")}
+        if _channel_needs_auth(state, task["channel"]):
+            channel = task["channel"]
+            record = _auth_record(state, channel) or {}
+            # 用户已声明登录但结构证据不足：先给"点进账号页面再核验"的具体指引，
+            # 不重复弹登录页，也不把用户的话当成没登录。
+            claimed = bool(record.get("user_claim")) or record.get("status") == "reconfirm_required"
+            if claimed and record.get("status") != "verified":
+                from .platform_auth import reconfirm_steps
+                steps = reconfirm_steps(channel, record.get("problems") or record.get("last_problems") or [],
+                                        int(record.get("reconfirm_attempts") or 0))
+                if steps["attempts"] < steps["limit"]:
+                    return {"action": "wait_user_reconfirm", "run_id": state["run_id"],
+                            "stage": stage, "channel": channel, "task_id": task["task_id"],
+                            "tab_id": record.get("tab_id"),
+                            "browser_context_id": record.get("backend_session_id"),
+                            "header_signal": record.get("header_signal"),
+                            "reconfirm": steps,
+                            "message": ("用户已声明登录，但核验还差一项结构证据（见 reconfirm.steps）。"
+                                        "请用户在同一个标签页点进账号页面并刷新，然后重新 auth-probe；"
+                                        "助手不得自行判定为已登录")}
+                if record.get("status") != "waiting_user":
+                    return {"action": "open_auth_tab", "run_id": state["run_id"], "stage": stage,
+                            "channel": channel, "task_id": task["task_id"],
+                            "login_url": login_url(channel),
+                            "browser_surface": (state.get("scope") or {}).get("browser_surface"),
+                            "browser_status": (state.get("browser") or {}).get("status"),
+                            "access_mode": channel_registry.access_mode(channel),
+                            "reconfirm": steps,
+                            "message": (f"该平台已连续 {steps['attempts']} 次核验未通过（上限 {steps['limit']}）。"
+                                        "可重新打开登录页再试；若仍不通过，建议记 blocked 并推进其他渠道，"
+                                        "不要把未覆盖算作零岗位")}
+            if record.get("status") == "waiting_user":
+                return {"action": "wait_user_auth", "run_id": state["run_id"], "stage": stage,
+                        "channel": channel, "task_id": task["task_id"],
+                        "tab_id": record.get("tab_id"),
+                        "browser_context_id": record.get("backend_session_id"),
+                        "login_url": record.get("login_url"),
+                        "browser_surface": (state.get("scope") or {}).get("browser_surface"),
+                        "message": "已在本机独立浏览器打开登录入口，等待用户在同一会话完成登录后提交核验"}
+            if record.get("status") == "blocked":
+                return {"action": "channel_blocked", "run_id": state["run_id"], "stage": stage,
+                        "channel": channel, "reason": record.get("reason"),
+                        "message": "该平台登录受阻；记录原因后可跳过该平台，其余工作继续"}
+            return {"action": "open_auth_tab", "run_id": state["run_id"], "stage": stage,
+                    "channel": channel, "task_id": task["task_id"], "login_url": login_url(channel),
+                    "browser_surface": (state.get("scope") or {}).get("browser_surface"),
+                    "browser_status": (state.get("browser") or {}).get("status"),
+                    "access_mode": channel_registry.access_mode(channel),
+                    "message": ("该平台的业务搜索前先在本机独立浏览器打开登录页并核验当前会话"
+                                "（用 auth-open 命令，不要用内嵌预览）；未登录则交给用户登录")}
 
     if task:
-        action = "read_entry" if task["route"] in ("enterprise", "entry_reuse", "announcement_reverse",
-                                                   "enterprise_fallback") else "search_task"
+        action = "read_entry" if task["route"] in ("enterprise", "entry_reuse",
+                                                   "announcement_reverse", "enterprise_fallback") \
+            else "search_task"
         return {"action": action, "run_id": state["run_id"], "stage": stage,
                 "task_id": task["task_id"], "channel": task["channel"], "route": task["route"],
                 "query": task["query"], "company": task["company"],
-                "target_city": task["target_city"], "attempts": task["attempts"]}
+                "target_city": task["target_city"], "attempts": task["attempts"],
+                "scope": scope_of(task), "access_mode": channel_registry.access_mode(task["channel"]),
+                "budget_remaining": task_budget_remaining(state, task)}
+
+    if task is None:
+        # 有未处置任务但被平台状态挡住：先给结构化原因，不要笼统地 await_resolution。
+        for blocked in [t for t in state["tasks"]
+                        if t["stage"] == stage and t["status"] not in TASK_TERMINAL]:
+            gate = platform_gate(state, blocked["channel"])
+            if not gate:
+                continue
+            if gate.get("state") == "capability_gap":
+                return {"action": "capability_gap", "run_id": state["run_id"], "stage": stage,
+                        "channel": blocked["channel"], "task_id": blocked["task_id"],
+                        "requires_local_connector": gate.get("requires_local_connector"),
+                        "reason": gate.get("reason"),
+                        "message": ("本轮要求用户本机独立浏览器，但本机探测不到可用浏览器；"
+                                    "不会回退到 agent 内嵌预览。请在本机安装 Chrome/Edge 或提供本机连接程序，"
+                                    "记录能力缺口后继续其他渠道")}
+            if gate.get("state") in ("cooling", "blocked"):
+                return {"action": "channel_blocked" if gate["state"] == "blocked"
+                        else "channel_cooling",
+                        "run_id": state["run_id"], "stage": stage, "channel": blocked["channel"],
+                        "until": gate.get("until"), "reason": gate.get("reason"),
+                        "message": ("该平台处于冷却/受限状态（跨 run 保留）：按阶段规则推进其他可访问渠道，"
+                                    "到期或用户显式重试后再恢复")}
 
     if _stage_is_closable(state, stage):
         return {"action": "close_stage", "run_id": state["run_id"], "stage": stage}
 
-    # 还有未处置任务但当前无法执行（重试耗尽/待用户决定）。
     pending = [t for t in state["tasks"] if t["stage"] == stage and t["status"] not in TASK_TERMINAL]
     return {"action": "await_resolution", "run_id": state["run_id"], "stage": stage,
             "tasks": [{"task_id": t["task_id"], "channel": t["channel"], "status": t["status"],
@@ -587,8 +787,10 @@ def _next_task(state, stage):
         if task["status"] in ("pending", "failed"):
             if task["attempts"] >= MAX_TASK_ATTEMPTS:
                 continue
-            # 该渠道配额已用完：不再派活，交给 close_stage 记成 budget_exhausted。
-            if channel_budget_remaining(state, task["channel"], task.get("target_city")) == 0:
+            gate = platform_gate(state, task["channel"])
+            if gate and gate.get("state") in ("cooling", "blocked", "capability_gap"):
+                continue
+            if task_budget_remaining(state, task) == 0:
                 continue
             return task
     return None
@@ -617,27 +819,34 @@ def _advance_stage(state, stage):
 # ---------------------------------------------------------------- 提交回执
 
 PLAN_FIELDS = ("task_id", "query", "target_city", "role_keyword", "channel", "route", "stage", "company")
-RECEIPT_ALLOWED = ("status", "search_tool", "executed_at", "candidate_count", "evidence_ref",
-                   "reason", "search_mode", "lead_only", "exhausted", "derived", "company_waivers")
+# 兼容旧调用方：真正的字段清单只有 receipts.RESULT_FIELDS 一份。
+RECEIPT_ALLOWED = receipts.RESULT_FIELDS
 
 
 def record_action(state, payload, workspace=None):
     """提交实际执行结果。计划字段不可被回执覆盖。"""
-    action = payload.get("action") or payload.get("kind")
-    if action in (None, "search", "search_task", "read_entry"):
-        return _record_search(state, payload, workspace)
+    action = payload.get("action") or payload.get("kind") or "search"
+    task = None
+    if action in ("search", "search_task", "read_entry") and payload.get("task_id"):
+        task = next((t for t in state["tasks"] if t["task_id"] == payload["task_id"]), None)
+    normalized = receipts.normalize(payload, task=task, run_protocol=state.get("receipt_protocol"))
+    action = normalized["action"]
+    if action in ("search", "search_task", "read_entry"):
+        return _record_search(state, normalized, workspace)
     if action in ("auth_open", "open_auth_tab"):
-        return _record_auth_open(state, payload, workspace)
+        return _record_auth_open(state, normalized, workspace)
     if action in ("auth_probe", "auth_verified", "inspect_session"):
-        return _record_auth_probe(state, payload, workspace)
+        return _record_auth_probe(state, normalized, workspace)
+    if action in ("user_claimed_login", "login_claim"):
+        return _record_auth_claim(state, normalized, workspace)
     if action in ("skip", "skipped_by_user"):
-        return _record_skip(state, payload, workspace)
+        return _record_skip(state, normalized, workspace)
     if action in ("blocked", "channel_blocked"):
-        return _record_blocked(state, payload, workspace)
+        return _record_blocked(state, normalized, workspace)
     if action in ("register_derived", "derive", "register_candidates"):
-        return _record_derived(state, payload, workspace)
+        return _record_derived(state, normalized, workspace)
     if action == "scope_adjust":
-        return _record_scope_adjust(state, payload, workspace)
+        return _record_scope_adjust(state, normalized, workspace)
     raise ValueError("未知动作：" + str(action))
 
 
@@ -667,97 +876,105 @@ def _assert_auth(state, channel):
         return
     raise ValueError(
         f"{channel} 尚未完成当前会话登录核验（状态：{status}）；"
-        "请先执行 next-action 给出的 open_auth_tab / wait_user_auth 流程，"
-        "核验通过后才允许该平台业务搜索")
+        "请先执行 next-action 给出的 open_auth_tab / wait_user_auth / wait_user_reconfirm 流程；"
+        "用户若已声明登录但核验不通过，用 action=user_claimed_login 记录声明，"
+        "再按 reconfirm 指引让用户点进账号页面后重新 auth-probe。核验通过后才允许该平台业务搜索")
 
 
-def _normalize_identified(identified):
-    """identified 既可以是企业名，也可以是 {company,url}；统一成 [{company,url}]。"""
-    out = []
-    for item in identified or []:
-        if isinstance(item, dict):
-            name = str(item.get("company") or item.get("name") or "").strip()
-            url = (item.get("url") or "").strip() or None
-        else:
-            name, url = str(item).strip(), None
-        if name:
-            out.append({"company": name, "url": url})
-    return out
+def _record_search(state, receipt, workspace):
+    task = _find_task(state, receipt.get("task_id"))
 
-
-def _record_search(state, payload, workspace):
-    task = _find_task(state, payload.get("task_id"))
+    # 1) 幂等：同一 receipt_id 重放，不扣预算、不改证据时间；预算耗尽、阶段已推进后也照样成功。
+    #    幂等判断必须放在阶段/配额检查之前，否则"重放"会被误判成"抢跑"或"超预算"。
+    if receipts.is_duplicate(task, receipt):
+        return {"recorded": "search", "duplicate": True, "task": _public_task(task),
+                "next": next_action(state)}
     _assert_current_stage(state, task)
-    # 分渠道配额：本渠道额度用完就拒收，不再靠总池"先到先得"挤占别的渠道。
-    cap = channel_budget_cap(state, task["channel"])
-    if cap is not None:
-        used = channel_budget_used(state, task["channel"], task.get("target_city"))
-        if used >= cap:
+    # 2) 修订：同一 attempt_id 补充 exhausted / 结束证据 / 派生关系，保留审计，不重复计次。
+    revision = receipts.is_revision(task, receipt)
+    # 3) 新执行：先查配额，再扣费。
+    if not revision:
+        limit = budgets.channel_remaining(state, task["channel"], task.get("target_city"))
+        if limit == 0:
             raise ValueError(
-                f"渠道 {task['channel']} 本轮预算已用完（配额 {cap} 次，已用 {used} 次）。"
-                f"请改用该渠道已有的读取结果，或记 blocked/skipped_by_user 说明未覆盖部分；"
-                f"要追加额度请在新一轮 start-run 里提高 budget.per_channel")
+                f"渠道 {channel_registry.label(task['channel'])} 本轮预算已用完"
+                f"（配额 {budgets.cap((state.get('scope') or {}).get('budget') or {}, task['channel'], task.get('target_city'))} 次，"
+                f"已用 {budgets.used(state, task['channel'], task.get('target_city'))} 次）。"
+                "请改用该渠道已有的读取结果，或记 blocked/skipped_by_user 说明未覆盖部分；"
+                "要追加额度请在新一轮 start-run 里提高 budget.per_channel")
+        kind = budgets.kind_for(task.get("route"))
+        kind_limit = budgets.kind_remaining(state, kind, task.get("target_city"))
+        if kind_limit == 0:
+            raise ValueError(
+                f"该城市 {kind} 计量预算已用完（列表页/详情分别计量，不能靠搜索次数绕过）；"
+                "请停止继续打开页面并记录覆盖缺口")
+
     _assert_auth(state, task["channel"])
-    for field in payload:
-        if field in PLAN_FIELDS and payload[field] != task.get(field):
+    for field in PLAN_FIELDS:
+        if field in receipt and receipt[field] not in (None, task.get(field)):
             raise ValueError(
-                f"回执不能覆盖计划字段 {field}：计划为 {task.get(field)!r}，回执为 {payload[field]!r}")
-    status = payload.get("status", "success")
-    if status not in ("success", "failed", "restricted", "budget_exhausted", "not_run"):
+                f"回执不能覆盖计划字段 {field}：计划为 {task.get(field)!r}，回执为 {receipt[field]!r}")
+
+    status = receipt.get("status", "success")
+    if status not in receipts.STATUSES:
         raise ValueError("未知执行状态：" + str(status))
-    if status in ("success", "failed", "restricted") and not payload.get("executed_at"):
+    if status in ("success", "failed", "restricted") and not receipt.get("executed_at"):
         raise ValueError("实际执行必须带 executed_at；未执行的查询不能记为执行过")
-    derived = payload.get("derived") or []
-    waivers = payload.get("company_waivers") or []
-    legacy = bool(payload.get("legacy_receipt"))
-    identified = payload.get("identified")
-    needs_identified = (task["route"] == "research"
-                        or int(payload.get("candidate_count") or 0) > 0)
-    normalized_id = _normalize_identified(identified)
-    if status == "success" and task["route"] in DISCOVERY_ROUTES and not legacy \
-            and needs_identified and identified is None:
-        raise ValueError(
-            f"任务 {task['task_id']} 是官网发现类检索，必须附 identified：检索中识别到的企业全名单"
-            "（哪怕不打算核实也要列出来，用 company_waivers 说明原因）。"
-            "candidate_count 只统计你打算处置的企业，程序用 identified 核对有没有漏")
-    if status == "success" and task["route"] in EXHAUSTION_ROUTES and payload.get("exhausted") is None and not legacy:
+
+    normalized_id = receipt.get("identified")
+    derived = receipt.get("derived") or []
+    waivers = receipt.get("company_waivers") or []
+    legacy = bool(receipt.get("legacy"))
+
+    if not legacy and status == "success" and task["route"] in EXHAUSTION_ROUTES \
+            and receipt.get("exhausted") is None:
         raise ValueError(
             f"任务 {task['task_id']} 未声明 exhausted：必须说明该检索是否已到底"
             "（无更多页/无更多结果 = true；还有后续页或结果 = false）。"
             "渠道要跑到底，不能只跑第一页就关阶段")
-    if status == "success" and task["route"] in DISCOVERY_ROUTES and not legacy:
-        # 识别清单里带官网链接的企业必须逐家核实，不能用"不可核实"豁免掉。
-        by_name = {x["company"]: x.get("url") for x in normalized_id}
+
+    if not legacy and status == "success" and task["route"] in DISCOVERY_ROUTES:
+        by_name = {x["company"]: x.get("url") for x in (normalized_id or [])}
         bad = [w.get("company") for w in waivers if by_name.get(str(w.get("company") or "").strip())]
         if bad:
             raise ValueError(
                 "以下企业已找到官网链接，必须逐家核实、不能用 company_waivers 豁免："
                 + "、".join(map(str, bad)) +
                 "；核实到官网预算耗尽为止（读不到就记 blocked 并附失败证据）")
-        found = max(int(payload.get("candidate_count") or 0), len(normalized_id))
+        found = max(int(receipt.get("candidate_count") or 0), len(normalized_id or []))
         if found > len(derived) + len(waivers):
             raise ValueError(
                 f"官网发现类任务 {task['task_id']} 产出 {found} 条企业线索，但只登记了 "
                 f"{len(derived)} 条核实任务、{len(waivers)} 条不可核实说明。"
                 "研究型检索得到的企业必须逐家转成官网核实任务（derived），"
                 "无法核实的要写进 company_waivers 并给理由")
-    # 幂等：同一条回执重复提交不重复扣预算、不重复改证据时间。
-    receipt_hash = hashlib.sha256(json.dumps(
-        {k: payload.get(k) for k in ("task_id", "status", "executed_at", "search_tool", "candidate_count")},
-        sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-    if task.get("receipt_hash") == receipt_hash:
-        return {"recorded": "search", "duplicate": True, "task": _public_task(task),
-                "next": next_action(state)}
-    task["receipt_hash"] = receipt_hash
-    task["attempts"] += 1
-    task["executed_at"] = payload.get("executed_at")
-    task["search_tool"] = payload.get("search_tool") or payload.get("tool")
-    task["candidate_count"] = int(payload.get("candidate_count") or 0)
-    task["evidence_ref"] = payload.get("evidence_ref")
-    task["reason"] = payload.get("reason")
-    task["receipt_status"] = status
-    if payload.get("exhausted") is not None:
-        task["exhausted"] = bool(payload["exhausted"])
+
+    # 写回任务
+    task["receipt_ids"] = list(dict.fromkeys(task.get("receipt_ids", []) + [receipt["receipt_id"]]))
+    task["attempt_ids"] = list(dict.fromkeys(task.get("attempt_ids", []) + [receipt["attempt_id"]]))
+    task["receipt_version"] = receipt["receipt_version"]
+    if not revision:
+        task["attempts"] += 1
+        task["executed_at"] = receipt.get("executed_at")
+        task["search_tool"] = receipt.get("search_tool") or receipt.get("tool")
+        task["candidate_count"] = int(receipt.get("candidate_count") or 0)
+        task["evidence_ref"] = receipt.get("evidence_ref")
+        task["reason"] = receipt.get("reason")
+        task["receipt_status"] = status
+        task["access_kind"] = budgets.kind_for(task.get("route"))
+    else:
+        task.setdefault("revisions", []).append({
+            "at": now(), "receipt_id": receipt["receipt_id"],
+            "fields": sorted(k for k in receipts.RESULT_FIELDS if receipt.get(k) is not None),
+        })
+        for field in ("evidence_ref", "reason", "candidate_count", "search_mode", "lead_only"):
+            if receipt.get(field) is not None:
+                task[field] = receipt[field]
+        if receipt.get("executed_at"):
+            task.setdefault("original_executed_at", task.get("executed_at"))
+
+    if receipt.get("exhausted") is not None:
+        task["exhausted"] = bool(receipt["exhausted"])
     elif legacy:
         task["legacy_exhaustion"] = True
         task["exhaustion_note"] = "历史回执未声明检索是否到底，按旧协议接受但不算新版检查通过"
@@ -780,37 +997,98 @@ def _record_search(state, payload, workspace):
         task["status"] = "failed" if task["attempts"] < MAX_TASK_ATTEMPTS else "blocked"
         if task["status"] == "blocked":
             task["reason"] = (task.get("reason") or "") + "（重试耗尽）" if task.get("reason") else "重试耗尽"
+
+    if not revision:
+        budgets.charge(state, task, task.get("access_kind"))
+    _note_platform(state, workspace, task, status, receipt.get("reason"))
     _append_event(state, {"kind": "search", "task_id": task["task_id"], "stage": task["stage"],
                           "channel": task["channel"], "status": status,
+                          "revision": revision, "scope": scope_of(task),
                           "executed_at": task["executed_at"], "tool": task["search_tool"],
-                          "candidate_count": task["candidate_count"], "evidence_ref": task["evidence_ref"]})
-    _track_budget(state, task)
+                          "candidate_count": task["candidate_count"],
+                          "evidence_ref": task["evidence_ref"],
+                          "exhausted": task.get("exhausted")})
     nxt = next_action(state)   # 可能自动关闭本阶段并推进；必须在落盘前算完
     if workspace:
         save_state(state, workspace)
-    return {"recorded": "search", "task": _public_task(task), "next": nxt}
+    result = {"recorded": "search", "task": _public_task(task), "scope": scope_of(task),
+              "next": nxt}
+    if revision:
+        result["revision"] = True
+    return result
 
 
-def _track_budget(state, task):
-    if task.get("receipt_status") not in ("success", "failed", "restricted"):
+def charge_access(state, *, channel, city, kind=budgets.SEARCH, count=1, note=None):
+    """为一个不经过任务回执的动作记账（例如浏览器辅助检索的页面读取）。
+
+    仍然走同一本预算账与同一套上限：渠道配额 + 计量类型。超限直接报错，
+    不允许"绕过 record-action 就不受预算约束"。
+    """
+    if kind not in budgets.KINDS:
+        raise ValueError("未知计量类型：" + str(kind))
+    task = {"channel": channel, "target_city": city, "stage": channel_stage(channel)}
+    for _ in range(int(count)):
+        if budgets.channel_remaining(state, channel, city) == 0:
+            raise ValueError(
+                f"渠道 {channels_label(channel)} 本轮预算已用完"
+                f"（已用 {budgets.used(state, channel, city)} 次）；请提高配额或减少页面数量")
+        if kind != budgets.SEARCH and budgets.kind_remaining(state, kind, city) == 0:
+            raise ValueError(
+                f"该城市 {kind} 计量预算已用完；浏览器辅助检索不能绕过页面读取上限")
+        budgets.charge(state, task, kind, include_search=(kind == budgets.SEARCH))
+    _append_event(state, {"kind": "access_charge", "channel": channel, "city": city,
+                          "kind": kind, "count": int(count), "note": note})
+    return budgets.used(state, channel, city, kind)
+
+
+def channels_label(name):
+    return channel_registry.label(name)
+
+
+def record_browser_search(state, channel, summary: dict):
+    """记录一次浏览器辅助检索（不进任务簿，但进事件与运行状态）。"""
+    summary = dict(summary)
+    summary.setdefault("at", now())
+    state.setdefault("browser_searches", []).append(summary)
+    _append_event(state, {"kind": "browser_search", "channel": channel,
+                          "keywords": summary.get("keywords"),
+                          "location": summary.get("location"),
+                          "pages_read": summary.get("pages_read"),
+                          "jobs_found": summary.get("jobs_found")})
+    return summary
+
+
+def _note_platform(state, workspace, task, status, reason):
+    channel = task["channel"]
+    if channel not in PLATFORM_CHANNELS:
         return
-    city = task.get("target_city")
-    used = state.setdefault("budget_used", {}).setdefault("searches", {})
-    used[city] = used.get(city, 0) + 1
-    # 分阶段账：官网核实要一直做到"官网预算用完"，不能靠总账里别的渠道额度续命。
-    by_stage = state["budget_used"].setdefault("by_stage", {}).setdefault(task["stage"], {})
-    by_stage[city] = by_stage.get(city, 0) + 1
-    by_channel = state["budget_used"].setdefault("by_channel", {}).setdefault(task["channel"], {})
-    by_channel[city] = by_channel.get(city, 0) + 1
+    try:
+        from . import access_control
+    except Exception:
+        access_control = None
+    if status == "restricted":
+        text = str(reason or "")
+        server_limited = any(k in text for k in ("429", "频率", "限流", "rate limit",
+                                                 "captcha", "验证码", "安全验证", "受限", "拒绝"))
+        kind = "rate_limited" if ("429" in text or "频率" in text or "限流" in text.lower()) else \
+            "captcha" if ("验证码" in text or "captcha" in text.lower()) else "restricted"
+        view = {"state": "blocked" if kind in ("restricted", "captcha") else "cooling",
+                "reason": reason, "since": now()}
+        state.setdefault("platform_state", {})[channel] = view
+        if workspace and access_control and server_limited:
+            access_control.note_restricted(workspace, channel, reason=text, kind=kind,
+                                           run_id=state.get("run_id"))
+    elif status == "success":
+        state.setdefault("platform_state", {}).pop(channel, None)
+        if workspace and access_control:
+            try:
+                access_control.note_success(workspace, channel, run_id=state.get("run_id"))
+            except Exception:
+                pass
 
 
-def stage_budget_remaining(state, stage, city):
-    """该阶段在该城市还能做几次；None 表示计划未设上限。"""
-    cap = (state.get("scope", {}).get("budget") or {}).get("searches_per_city")
-    if cap is None:
-        return None
-    used = ((state.get("budget_used") or {}).get("by_stage", {}).get(stage, {}) or {}).get(city, 0)
-    return max(0, int(cap) - int(used))
+def stage_budget_used(state, stage, city):
+    return ((state.get("budget_used") or {}).get("by_stage", {}).get(stage, {}) or {}).get(city, 0)
 
 
 def _task_skeleton(source, *, task_id, route, query, company=None, extra=None):
@@ -820,14 +1098,21 @@ def _task_skeleton(source, *, task_id, route, query, company=None, extra=None):
            "planned_status": "derived", "status": "pending", "attempts": 0,
            "executed_at": None, "search_tool": None, "candidate_count": 0, "evidence_ref": None,
            "reason": None, "derived_from": source["task_id"], "browse_page": None,
-           "browse_url": None, "covers_roles": None, "skipped_stage": False, "exhausted": None}
+           "browse_url": None, "covers_roles": None, "skipped_stage": False, "exhausted": None,
+           "query_scope": source.get("query_scope"),
+           "filter_fingerprint": source.get("filter_fingerprint"),
+           "pagination_chain_id": source.get("pagination_chain_id")}
     if extra:
         row.update(extra)
     return row
 
 
 def _create_derived(state, source, items, kind="company"):
-    """派生任务与来源任务同阶段：官网线索只能回到官网阶段核实，不能被推到别的渠道后面。"""
+    """派生任务与来源任务同阶段。
+
+    `kind=page` 的下一页继承**同一条分页链**，因此末页到底只关闭这条链；
+    `kind=company` 的核实任务各有自己的链，互不覆盖。
+    """
     created = []
     for item in items:
         seq = len(source.get("derived_ids", [])) + len(created) + 1
@@ -836,7 +1121,9 @@ def _create_derived(state, source, items, kind="company"):
             row = _task_skeleton(source, task_id=task_id, route=source["route"],
                                  query=item.get("url") or source["query"],
                                  extra={"browse_url": item.get("url"),
-                                        "browse_page": item.get("page")})
+                                        "browse_page": item.get("page"),
+                                        "pagination_chain_id": source.get("pagination_chain_id")
+                                        or source.get("browse_url") or source["task_id"]})
         else:
             name = (item.get("company") or item.get("name") or "").strip()
             if not name:
@@ -845,7 +1132,10 @@ def _create_derived(state, source, items, kind="company"):
             row = _task_skeleton(source, task_id=task_id, route=VERIFY_ROUTE,
                                  query=f'{name} {source.get("target_city") or ""} '
                                        f'{source.get("role_keyword") or ""} 官网 招聘'.replace("  ", " "),
-                                 company=name, extra={"company_url": item.get("url")})
+                                 company=name,
+                                 extra={"company_url": item.get("url"),
+                                        "query_scope": f"verify:{name}",
+                                        "pagination_chain_id": task_id})
         if any(t["task_id"] == task_id for t in state["tasks"]):
             continue
         state["tasks"].append(row)
@@ -878,46 +1168,145 @@ def _record_derived(state, payload, workspace):
 
 
 def _record_auth_open(state, payload, workspace):
+    """记录真实的浏览器打开事件。只打印链接、或只有截图，都会被拒绝。"""
     channel = payload.get("channel")
     if channel not in PLATFORM_CHANNELS:
         raise ValueError("该渠道不需要登录交接：" + str(channel))
+    from . import platform_auth
+    if payload.get("opened_url_only"):
+        raise ValueError("不得把'打印了登录链接'记成'浏览器已打开'；请用 auth-open 实际打开独立窗口")
+    handle = {"session_id": payload.get("browser_session_id") or payload.get("browser_context_id"),
+              "target_id": payload.get("tab_id"),
+              "surface": payload.get("surface"),
+              "backend": payload.get("backend"),
+              "pid": payload.get("pid"), "profile_dir": payload.get("profile_dir")}
+    event = platform_auth.build_open_record(channel, handle,
+                                            login_url=payload.get("login_url") or login_url(channel))
+    if (payload.get("backend") or "") == platform_auth.HOST_BROWSER:
+        event["host_browser_id"] = payload.get("browser_id")
+        event["host_tab_id"] = str(payload.get("tab_id"))
+        event["host_tool"] = payload.get("host_tool") or "workbuddy_browser"
+    if payload.get("opened_at"):
+        event["opened_at"] = payload["opened_at"]
     record = {
         "run_id": state["run_id"], "channel": channel,
-        "browser_context_id": payload.get("browser_context_id"),
-        "tab_id": payload.get("tab_id"),
-        "login_url": payload.get("login_url") or login_url(channel),
+        "browser_context_id": event["backend_session_id"],
+        "backend_session_id": event["backend_session_id"],
+        "tab_id": event["tab_id"],
+        "login_url": event["login_url"],
         "checked_at": now(), "status": "waiting_user",
+        "surface": event["surface"],
+        "opened_event": event,
         "evidence_ref": payload.get("evidence_ref"),
-        "reason": payload.get("reason") or "已打开登录入口，等待用户完成登录",
+        "reason": payload.get("reason") or "已在本机独立浏览器打开登录入口，等待用户完成登录",
     }
     state.setdefault("auth", {})[channel] = record
+    if workspace:
+        refresh_browser_state(state, workspace)
     _append_event(state, {"kind": "auth_open", "channel": channel,
-                          "browser_context_id": record["browser_context_id"], "tab_id": record["tab_id"],
-                          "login_url": record["login_url"]})
+                          "backend_session_id": record["backend_session_id"],
+                          "tab_id": record["tab_id"], "login_url": record["login_url"],
+                          "surface": record["surface"]})
     nxt = next_action(state)
     if workspace:
         save_state(state, workspace)
-    return {"recorded": "auth_open", "channel": channel, "status": "waiting_user", "next": nxt}
+    return {"recorded": "auth_open", "channel": channel, "status": "waiting_user",
+            "tab_id": record["tab_id"], "browser_session_id": record["backend_session_id"],
+            "next": nxt}
+
+
+def invalidate_auth(state, channel, reason):
+    """会话层面的失效（标签页被关、浏览器重启、账号切换）。
+
+    只让该平台的登录态失效，任务保持 pending：用户重新登录后可继续，
+    不会把整个渠道记成受阻。
+    """
+    record = dict((state.get("auth") or {}).get(channel) or {})
+    record.update({"run_id": state["run_id"], "channel": channel, "status": "invalidated",
+                   "checked_at": now(), "reason": reason})
+    state.setdefault("auth", {})[channel] = record
+    _append_event(state, {"kind": "auth_invalidated", "channel": channel, "reason": reason})
+    return record
 
 
 def _record_auth_probe(state, payload, workspace):
-    from .platform_auth import verify_probe
+    from .platform_auth import verify_probe, reconfirm_steps, verify_host_probe, HOST_BROWSER
     channel = payload.get("channel")
     if channel not in PLATFORM_CHANNELS:
         raise ValueError("该渠道不需要登录核验：" + str(channel))
-    record, problems = verify_probe(state, channel, payload, workspace)
+    previous = (state.get("auth", {}) or {}).get(channel) or {}
+    host_mode = ((previous.get("opened_event") or {}).get("backend") == HOST_BROWSER
+                 or (payload.get("backend") or "") == HOST_BROWSER)
+    if host_mode:
+        record, problems = verify_host_probe(state, channel, payload, workspace)
+    else:
+        record, problems = verify_probe(state, channel, payload, workspace)
+    # 打开事件是后续核验的绑定锚点：核验结果覆盖记录时必须保留，否则下一次
+    # 快照核验会被判成"没有打开事件"。
+    if previous.get("opened_event"):
+        record["opened_event"] = previous["opened_event"]
+    # 用户已经声明登录：保留声明与重试计数，下一次仍不通过时继续给"点进页面再确认"的指引。
+    for key in ("user_claim", "reconfirm_attempts", "last_problems", "last_probe_at"):
+        if key in previous:
+            record[key] = previous[key]
+    if record["status"] != "verified":
+        record["reconfirm_attempts"] = int(previous.get("reconfirm_attempts") or 0) + 1
+        record["last_problems"] = problems
+        record["last_probe_at"] = record.get("checked_at")
+    else:
+        record.pop("last_problems", None)
     state.setdefault("auth", {})[channel] = record
     _append_event(state, {"kind": "auth_probe", "channel": channel, "status": record["status"],
-                          "browser_context_id": record.get("browser_context_id"),
-                          "tab_id": record.get("tab_id"), "problems": problems})
+                          "browser_session_id": record.get("backend_session_id"),
+                          "tab_id": record.get("tab_id"), "problems": problems,
+                          "header_signal": record.get("header_signal")})
     nxt = next_action(state)
     if workspace:
         save_state(state, workspace)
     result = {"recorded": "auth_probe", "channel": channel, "status": record["status"],
-              "problems": problems, "next": nxt}
+              "problems": problems, "basis": record.get("verification_basis"),
+              "header_signal": record.get("header_signal"), "next": nxt}
     if record["status"] != "verified":
-        result["message"] = "核验未通过，不得据此放行该平台业务搜索"
+        result["message"] = ("核验未通过，不得据此放行该平台业务搜索"
+                             + ("；用户已声明登录，下一步会给重新确认指引"
+                                if record.get("user_claim") else ""))
+        result["reconfirm"] = reconfirm_steps(channel, problems,
+                                              int(record.get("reconfirm_attempts") or 0))
     return result
+
+
+def _record_auth_claim(state, payload, workspace):
+    """用户明确表示"我已经登录了"。
+
+    不改变 verified 结论（结构证据不足时仍不放行搜索），只把状态推进到
+    `reconfirm_required`，让 next_action 给出"点进账号页面再核验"的具体指引，
+    而不是把用户的话当成没登录。
+    """
+    from . import platform_auth
+    channel = payload.get("channel")
+    if channel not in PLATFORM_CHANNELS:
+        raise ValueError("该渠道不需要登录核验：" + str(channel))
+    previous = (state.get("auth", {}) or {}).get(channel) or {}
+    if not (previous.get("opened_event") or {}).get("backend_session_id"):
+        raise ValueError("还没有真实的浏览器打开事件：请先运行 auth-open，再让用户在该窗口登录")
+    claim = previous.get("user_claim") or {}
+    record = dict(previous)
+    record["user_claim"] = {"claimed_at": now(),
+                            "count": int(claim.get("count") or 0) + 1,
+                            "note": payload.get("reason") or payload.get("notes")}
+    if record.get("status") != "verified":
+        record["status"] = "reconfirm_required"
+        record["reason"] = "用户声明已登录，但结构化账号区域证据不足；等待用户点进账号页面后重新核验"
+    state.setdefault("auth", {})[channel] = record
+    _append_event(state, {"kind": "user_claimed_login", "channel": channel,
+                          "count": record["user_claim"]["count"], "status": record["status"]})
+    if workspace:
+        save_state(state, workspace)
+    steps = platform_auth.reconfirm_steps(channel, record.get("problems") or [],
+                                          int(record.get("reconfirm_attempts") or 0))
+    return {"recorded": "user_claimed_login", "channel": channel, "status": record["status"],
+            "claim_count": record["user_claim"]["count"], "reconfirm": steps,
+            "next": next_action(state)}
 
 
 def _record_skip(state, payload, workspace):
@@ -960,7 +1349,6 @@ def _record_blocked(state, payload, workspace):
     reason = payload.get("reason") or "受阻"
     task_id = payload.get("task_id")
     if task_id:
-        # 单任务受阻：一家企业的官网读不到，不能把同渠道其他企业的核实任务一起打掉。
         single = _find_task(state, task_id)
         if single["status"] in TASK_TERMINAL:
             raise ValueError("任务已处置，不能再记受阻：" + task_id)
@@ -989,7 +1377,7 @@ def _record_scope_adjust(state, payload, workspace):
         raise ValueError("范围调整必须由用户明确确认")
     state.setdefault("scope_adjustments", []).append(
         {"kind": "scope", "detail": payload.get("detail"), "reason": payload.get("reason"),
-         "at": now()})
+         "at": now(), "user_confirmed": True})
     _append_event(state, {"kind": "scope_adjust", "detail": payload.get("detail")})
     if workspace:
         save_state(state, workspace)
@@ -1002,6 +1390,7 @@ def _public_task(task):
     out["exhausted"] = task.get("exhausted")
     if task.get("derived_ids"):
         out["derived_ids"] = list(task["derived_ids"])
+    out["scope"] = scope_of(task)
     return out
 
 
@@ -1010,41 +1399,36 @@ def _public_task(task):
 def close_stage(state, stage, *, persist=True, workspace=None):
     tasks = _stage_tasks(state, stage)
     # 还没派出去的任务，若所属渠道配额已用完，就不能再挂着：如实转 budget_exhausted
-    # （计为缺口，不是"已完成"）。官网核实任务另按官网阶段账判断。
+    # （计为缺口，不是"已完成"）。口径与派发完全一致：渠道配额 + 计量类型上限。
     for task in tasks:
         if task["status"] not in ("pending", "failed"):
             continue
-        if task["route"] == VERIFY_ROUTE:
-            if stage_budget_remaining(state, stage, task.get("target_city")) == 0:
-                task["status"] = "budget_exhausted"
-                task["reason"] = "官网搜索预算已用尽，该企业未完成核实"
-            continue
-        if channel_budget_remaining(state, task["channel"], task.get("target_city")) == 0:
+        if task_budget_remaining(state, task) == 0:
             task["status"] = "budget_exhausted"
-            task["reason"] = (f"{CHANNEL_INFO.get(task['channel'], {}).get('label', task['channel'])}"
-                              f"本轮渠道配额已用尽，该任务未执行")
+            task["reason"] = budgets.exhausted_note(state, task)
     unhandled = [t["task_id"] for t in tasks if t["status"] not in TASK_TERMINAL]
     if unhandled:
         raise ValueError("阶段尚未结束：未处置任务 " + "、".join(unhandled))
-    # 预算还有却没声明搜到底 → 不许关阶段，先把该渠道跑干净。
-    open_work = _incomplete_searches(state, stage)
+    open_work = open_scopes(state, stage)
     if open_work:
         names = "、".join(
-            f"{t['task_id']}({t['channel']}, 余 {channel_budget_remaining(state, t['channel'], t.get('target_city'))} 次)"
-            for t in open_work)
-        raise ValueError("阶段不能关闭：以下渠道未声明检索到底且预算仍有剩余 —— " + names +
-                         "；请用 register_derived 派生下一页/下一轮任务继续检索，或补交 exhausted=true 说明已到底")
-    # 预算已经用尽的未完成检索，如实记成 budget_exhausted（这是可接受的收尾，但会算成缺口）。
-    # 例外：该渠道已有任一任务声明 exhausted=true（渠道整体跑到尾），前面几页不算缺口。
-    finished_channels = {t["channel"] for t in _stage_tasks(state, stage) if t.get("exhausted") is True}
+            f"{row['channel']}·{row['city']}·{row['query_scope'] or '全部岗位'}"
+            f"(余 {task_budget_remaining(state, row['tasks'][0])} 次)"
+            for row in open_work)
+        raise ValueError(
+            "阶段不能关闭：以下搜索范围未声明检索到底且预算仍有剩余 —— " + names +
+            "；请用 register_derived 派生下一页/下一轮任务继续检索，或补交 exhausted=true 说明已到底")
+    # 预算已经用尽的未完成检索，如实记成 budget_exhausted（可接受收尾，但算缺口）。
+    # 例外：同一搜索范围已有任务声明 exhausted=true（该范围整体跑到尾）。
+    done_scopes = exhausted_scope_keys(state, stage)
     for task in _stage_tasks(state, stage):
-        if task["channel"] in finished_channels:
+        if scope_key(task) in done_scopes:
             continue
-        if task["status"] == "executed" and task["route"] in EXHAUSTION_ROUTES and task.get("exhausted") is False \
-                and channel_budget_remaining(state, task["channel"], task.get("target_city")) == 0:
+        if task["status"] == "executed" and task["route"] in EXHAUSTION_ROUTES \
+                and task.get("exhausted") is False \
+                and task_budget_remaining(state, task) == 0:
             task["status"] = "budget_exhausted"
-            task["reason"] = "该渠道配额已用尽，检索未到底"
-    # 官网发现的企业线索没转成核实任务 → 不许关阶段。
+            task["reason"] = budgets.exhausted_note(state, task)
     gaps = derived_gaps(state, stage)
     if gaps:
         detail = "、".join(f"{g['task_id']} 还差 {g['missing']} 家" for g in gaps)
@@ -1057,7 +1441,8 @@ def close_stage(state, stage, *, persist=True, workspace=None):
     if not tasks:
         status = "closed_empty"
     state["stages"][stage] = {"status": status, "closed_at": now(), "reason": None,
-                              "counts": _count(tasks)}
+                              "counts": _count(tasks),
+                              "scopes": scope_completion(state, stage)}
     _append_event(state, {"kind": "close_stage", "stage": stage, "status": status})
     if persist and workspace:
         save_state(state, workspace)
@@ -1082,8 +1467,9 @@ def _count(tasks):
 
 def finalize(state, *, persist=True, workspace=None):
     """整轮完成判定。只有这里可以宣称 COMPLETE。"""
-    channels = [c for c in state["scope"]["channels"] if c not in NON_STAGE_CHANNELS]
+    channels_ = [c for c in state["scope"]["channels"] if c not in NON_STAGE_CHANNELS]
     stage_rows, channel_rows, unfinished = [], [], []
+    scopes = scope_completion(state)
     for stage in state["scope"]["stage_order"]:
         tasks = _stage_tasks(state, stage)
         counts = _count(tasks)
@@ -1091,23 +1477,32 @@ def finalize(state, *, persist=True, workspace=None):
         stage_rows.append({"stage": stage, "label": STAGE_LABELS.get(stage, stage),
                            "status": closed or ("in_progress" if tasks else "pending"),
                            "closed_at": state["stages"].get(stage, {}).get("closed_at"), **counts})
-    for channel in channels:
+    for channel in channels_:
         tasks = [t for t in state["tasks"] if t["channel"] == channel]
         counts = _count(tasks)
         auth = auth_status(state, channel) if channel in PLATFORM_CHANNELS else "not_required"
         reasons = sorted({t.get("reason") for t in tasks if t.get("reason")})
-        channel_rows.append({"channel": channel, "stage": channel_stage(channel), **counts,
-                             "budget_cap": channel_budget_cap(state, channel),
-                             "budget_used": channel_budget_used(
-                                 state, channel, (state["scope"].get("cities") or [None])[0]),
-                             "not_exhausted": sum(1 for t in tasks
-                                                  if t.get("exhausted") is False and not t.get("continued")
-                                                  and t["status"] in ("executed", "budget_exhausted")
-                                                  and not any(x.get("exhausted") is True for x in tasks)),
-                             "status": "not_covered" if counts["total"] == 0 else "recorded",
-                             "auth_status": auth,
-                             "auth_checked_at": (state.get("auth", {}).get(channel) or {}).get("checked_at"),
-                             "reason": "；".join(reasons) if reasons else None})
+        channel_scopes = [s for s in scopes if s["channel"] == channel]
+        not_exhausted = [s for s in channel_scopes if not s["exhausted"] and s["executed"]]
+        channel_rows.append({
+            "channel": channel, "stage": channel_stage(channel), **counts,
+            "budget_cap": budgets.cap((state.get("scope") or {}).get("budget") or {},
+                                      channel, (state["scope"].get("cities") or [None])[0]),
+            "budget_used": budgets.used(state, channel, (state["scope"].get("cities") or [None])[0]),
+            "list_page_used": budgets.used(state, channel, (state["scope"].get("cities") or [None])[0],
+                                           budgets.LIST_PAGE),
+            "detail_read_used": budgets.used(state, channel, (state["scope"].get("cities") or [None])[0],
+                                             budgets.DETAIL_READ),
+            "not_exhausted": len(not_exhausted),
+            "scopes": len(channel_scopes),
+            "access_mode": channel_registry.access_mode(channel),
+            "automation_allowed": channel_registry.automation_allowed(channel),
+            "status": "not_covered" if counts["total"] == 0 else "recorded",
+            "auth_status": auth,
+            "auth_checked_at": (state.get("auth", {}).get(channel) or {}).get("checked_at"),
+            "platform_state": (state.get("platform_state") or {}).get(channel),
+            "reason": "；".join(reasons) if reasons else None,
+        })
         for task in tasks:
             if task["status"] not in TASK_TERMINAL:
                 unfinished.append({"task_id": task["task_id"], "channel": channel,
@@ -1118,7 +1513,8 @@ def finalize(state, *, persist=True, workspace=None):
     pending = [r for r in channel_rows if r["pending"] or r["failed"]]
     uncovered = [r["channel"] for r in channel_rows if r.get("status") == "not_covered"]
     unverified_auth = [r["channel"] for r in channel_rows
-                       if r["auth_status"] in ("missing", "waiting_user", "expired", "mismatch")
+                       if r["auth_status"] in ("missing", "waiting_user", "expired", "mismatch",
+                                               "invalidated", "failed", "reconfirm_required")
                        and r["total"] > 0]
     reasons = []
     if unfinished:
@@ -1130,7 +1526,8 @@ def finalize(state, *, persist=True, workspace=None):
     elif gaps:
         verdict = "PARTIAL"
         reasons.append("存在受阻/用户跳过/预算缺口的渠道：" +
-                       "、".join(f"{r['channel']}({r['blocked']}受阻,{r['skipped_by_user']}跳过,{r['budget_exhausted']}预算)" for r in gaps))
+                       "、".join(f"{r['channel']}({r['blocked']}受阻,{r['skipped_by_user']}跳过,"
+                                 f"{r['budget_exhausted']}预算)" for r in gaps))
     elif executed == 0:
         verdict = "PARTIAL"
         reasons.append("本轮没有任何实际执行的任务，不能凭空回执视为完成")
@@ -1139,7 +1536,9 @@ def finalize(state, *, persist=True, workspace=None):
         reasons.append("存在未处置渠道")
     else:
         verdict = "COMPLETE"
-        reasons.append("声明范围内的阶段与渠道均有可核验的处置结论；不代表该网站全部岗位已查完")
+        reasons.append("本轮声明范围内的搜索范围均有可核验的处置结论；"
+                       "只表示声明范围完成，不代表该网站全部岗位已查尽")
+
     lead_gaps = derived_gaps(state)
     if lead_gaps:
         if verdict == "COMPLETE":
@@ -1155,12 +1554,13 @@ def finalize(state, *, persist=True, workspace=None):
         if verdict == "COMPLETE":
             verdict = "PARTIAL"
         reasons.append(f"{len(unverified)} 条检索未声明是否搜到底（升级前记录或旧协议回执），标记为未验证")
-    not_exhausted = [r for r in channel_rows if r.get("not_exhausted")]
+    not_exhausted = [s for s in scopes if not s["exhausted"] and s["executed"]]
     if not_exhausted:
         if verdict == "COMPLETE":
             verdict = "PARTIAL"
-        reasons.append("以下渠道未声明检索到底（预算已用尽或未继续翻页）：" +
-                       "、".join(f"{r['channel']}({r['not_exhausted']} 条)" for r in not_exhausted))
+        detail = "、".join(f"{s['channel']}/{s['city']}/{s['query_scope'] or '全部'}"
+                           f"({s['status']})" for s in not_exhausted[:8])
+        reasons.append("以下搜索范围未声明检索到底：" + detail)
     if uncovered and verdict == "COMPLETE":
         verdict = "PARTIAL"
         reasons.append("以下启用渠道没有任何任务与执行记录，不能计入完成：" + "、".join(uncovered))
@@ -1172,21 +1572,21 @@ def finalize(state, *, persist=True, workspace=None):
                            "、".join(STAGE_LABELS.get(x, x) for x in missing_stages))
         else:
             verdict = "PARTIAL"
-            reasons.append("本轮范围未经用户确认，只覆盖 " +
-                           "、".join(STAGE_LABELS.get(x, x) for x in state["scope"]["stage_order"] if x not in missing_stages) +
+            reasons.append("本轮范围未经用户确认（助手自行收窄），只覆盖 " +
+                           "、".join(STAGE_LABELS.get(x, x) for x in state["scope"]["stage_order"]
+                                    if x not in missing_stages) +
                            "；未纳入：" + "、".join(STAGE_LABELS.get(x, x) for x in missing_stages))
     for row in stage_rows:
         if row["status"] not in ("closed", "closed_with_gaps", "closed_empty") and row["total"]:
             if verdict == "COMPLETE":
                 verdict = "PARTIAL"
                 reasons.append(f"阶段 {row['label']} 尚未关闭")
-    if state.get("finished") and verdict == "COMPLETE":
-        pass
-    # 出结果闸门：只有所有阶段都收尾（含本地宝与公众号）才允许交付正式结果。
-    stages_open = [r for r in stage_rows if r["status"] not in ("closed", "closed_with_gaps", "closed_empty")]
+    stages_open = [r for r in stage_rows
+                   if r["status"] not in ("closed", "closed_with_gaps", "closed_empty")]
     blockers = []
     if unfinished:
-        blockers.append(f"{len(unfinished)} 个任务未处置：" + "、".join(t["task_id"] for t in unfinished[:6]))
+        blockers.append(f"{len(unfinished)} 个任务未处置：" +
+                        "、".join(t["task_id"] for t in unfinished[:6]))
     if stages_open:
         blockers.append("阶段未收尾：" + "、".join(f"{r['label']}({r['status']})" for r in stages_open))
     # 预算已经用尽时，"没到底"是如实的部分覆盖，不再是"还能继续却没做"的阻塞项。
@@ -1194,14 +1594,17 @@ def finalize(state, *, persist=True, workspace=None):
     budget_left = min([x for x in (budget_remaining(state, c) for c in cities) if x is not None],
                       default=None)
     if not_exhausted and (budget_left is None or budget_left > 0):
-        blockers.append("渠道未搜到底（预算仍有 %s 次）：%s" % (budget_left, "、".join(r["channel"] for r in not_exhausted)))
+        blockers.append("搜索范围未到底（预算仍有 %s 次）：%s" %
+                        (budget_left, "、".join(sorted({s["channel"] for s in not_exhausted}))))
     elif not_exhausted:
-        reasons.append("预算已用尽，以下渠道未搜到底，按部分覆盖交付：" +
-                       "、".join(r["channel"] for r in not_exhausted))
+        reasons.append("预算已用尽，以下搜索范围未搜到底，按部分覆盖交付：" +
+                       "、".join(sorted({s["channel"] for s in not_exhausted})))
     delivery_allowed = not blockers and verdict in ("COMPLETE", "PARTIAL")
+    budget_view = budgets.snapshot(state)
     completion = {
         "run_id": state["run_id"],
         "protocol_version": PROTOCOL_VERSION,
+        "receipt_protocol": state.get("receipt_protocol"),
         "plan_id": state.get("plan_id"),
         "config_fingerprint": state.get("config_fingerprint"),
         "generated_at": now(),
@@ -1210,14 +1613,22 @@ def finalize(state, *, persist=True, workspace=None):
         "stage_order": state["scope"]["stage_order"],
         "stages": stage_rows,
         "channels": channel_rows,
+        "scopes": scopes,
         "unfinished": unfinished,
         "executed_tasks": executed,
         "total_tasks": len(state["tasks"]),
         "partial_export": verdict != "COMPLETE",
         "delivery_allowed": delivery_allowed,
         "delivery_blockers": blockers,
-        "next_action": None if verdict == "COMPLETE" else next_action(state),
+        "scope_confirmed": bool(scope.get("user_scope_confirmed")),
+        "narrowed_by": scope.get("narrowed_by"),
+        "browser_surface": scope.get("browser_surface"),
+        "access": {"budget": budget_view, "browser": state.get("browser") or {},
+                   "platforms": state.get("platform_state") or {},
+                   "linkedin": {"access_mode": channel_registry.access_mode("linkedin"),
+                                "automation_allowed": channel_registry.automation_allowed("linkedin")}},
         "boundary": "本判定只覆盖经过本控制器记录的动作；未接入控制器的外部工具动作不在统计内。",
+        "next_action": None if verdict == "COMPLETE" else next_action(state),
     }
     state["completion"] = completion
     if persist and workspace:
@@ -1228,10 +1639,9 @@ def finalize(state, *, persist=True, workspace=None):
 
 
 def finish_run(state, workspace=None):
-    """允许某个阶段因为无任务而直接推进，直到所有阶段关闭或遇到待处置任务。"""
     while True:
         action = next_action(state)
-        if action["action"] in ("close_stage",):
+        if action["action"] == "close_stage":
             close_stage(state, state["current_stage"], workspace=workspace)
             nxt = _advance_stage(state, state["current_stage"])
             if not nxt:
@@ -1241,14 +1651,11 @@ def finish_run(state, workspace=None):
             if workspace:
                 save_state(state, workspace)
             continue
-        if action["action"] == "finalize":
-            return finalize(state, workspace=workspace)
         return finalize(state, workspace=workspace)
 
 
 def login_url(channel):
-    from .platform_auth import LOGIN_URLS
-    return LOGIN_URLS.get(channel)
+    return channel_registry.login_url(channel)
 
 
 # ---------------------------------------------------------------- 与新检索的衔接
@@ -1270,10 +1677,7 @@ def record_plan_run(state, plan):
 
 
 def tasks_for_receipt(state):
-    """把控制器里的任务投影回计划格式，供 validate_receipt 复用。
-
-    必须带 `status`：validate_receipt 会用它判断"超预算任务不能记为成功"。
-    """
+    """把控制器里的任务投影回计划格式，供 validate_receipt 复用。"""
     out = []
     for task in state["tasks"]:
         if task.get("skipped_stage"):
@@ -1295,12 +1699,45 @@ PLAN_STATUS_BACK = {
 }
 
 
+def claim_receipts(state, logs, *, run_id=None):
+    """按 run_id + task_id + attempt_id/receipt_id 去重，支持同一轮分批提交。
+
+    返回 (accepted, duplicates)。重复项被忽略而不是整批拒绝：同一批回执重放应当
+    幂等成功，第二批只提交新任务也应当继续累计。
+    """
+    run_id = run_id or state.get("run_id")
+    ledger = state.setdefault("receipt_ledger", {})
+    accepted, duplicates = [], []
+    for row in logs:
+        task_id = row.get("task_id")
+        attempt = row.get("attempt_id") or row.get("executed_at") or ""
+        receipt_id = row.get("receipt_id") or ""
+        key = f"{run_id}|{task_id}|{attempt}|{receipt_id}"
+        row = dict(row)
+        row.setdefault("run_id", run_id)
+        row.setdefault("attempt_id", attempt)
+        row.setdefault("receipt_id", receipt_id)
+        if key in ledger:
+            duplicates.append({"task_id": task_id, "key": key,
+                               "first_seen": ledger[key].get("at")})
+            continue
+        ledger[key] = {"at": now(), "task_id": task_id, "attempt_id": attempt,
+                       "receipt_id": receipt_id}
+        accepted.append(row)
+    return accepted, duplicates
+
+
 def merge_receipt(state, receipt, config, plan):
-    """把回执并入运行状态，同时保留原有 validate_receipt 的字段与预算校验。"""
+    """把回执并入运行状态，同时保留原有 validate_receipt 的字段与预算校验。
+
+    新版回执的 `exhausted/identified/derived/company_waivers` 必须原样保留，
+    不能在投影到任务时被字段清单过滤掉。
+    """
     from .planning import validate_receipt
     enriched_plan = dict(plan)
     enriched_plan["tasks"] = tasks_for_receipt(state)
-    logs = validate_receipt(config, enriched_plan, receipt)
+    protocol = state.get("receipt_protocol")
+    logs = validate_receipt(config, enriched_plan, receipt, run_protocol=protocol)
     recorded = []
     for log in logs:
         if log.get("status") == "not_run":
@@ -1308,44 +1745,47 @@ def merge_receipt(state, receipt, config, plan):
         task = next((t for t in state["tasks"] if t["task_id"] == log["task_id"]), None)
         if task is None:
             continue
-        payload = {k: log.get(k) for k in RECEIPT_ALLOWED if log.get(k) is not None}
-        payload.update(action="search", task_id=log["task_id"])
-        if log.get("exhausted") is None:
-            # 旧协议回执没有"是否到底"字段：允许入库，但标成历史未验证，不能算新版检查通过。
-            payload["legacy_receipt"] = True
-        _record_search(state, payload, None)
+        payload = {k: log.get(k) for k in receipts.RESULT_FIELDS if log.get(k) is not None}
+        payload.update({"action": "search", "task_id": log["task_id"],
+                        "receipt_version": receipt.get("receipt_version") or protocol,
+                        "receipt_id": log.get("receipt_id"),
+                        "attempt_id": log.get("attempt_id")})
+        _record_search(state, receipts.normalize(payload, task=task, run_protocol=protocol), None)
         recorded.append(log["task_id"])
     return logs, recorded
 
 
 def state_from_plan_logs(plan, logs, config=None, reports=None):
-    """没有 start-run 时，用计划＋回执临时重建一个只读运行快照。
-
-    这样 new-search / process-browser / 历史入口都能走同一个 finalizer，
-    而不是各写一套"看起来成功"的状态。
-    """
-    channels = list(plan.get("channels") or (config.sources if config else []))
-    order = stage_order(channels)
+    """没有 start-run 时，用计划＋回执临时重建一个只读运行快照。"""
+    channels_ = list(plan.get("channels") or (config.sources if config else []))
+    order = stage_order(channels_)
+    started = plan.get("created_at") or now()
     state = {
-        "schema_version": "workflow-run-1",
+        "schema_version": STATE_SCHEMA,
         "protocol_version": PROTOCOL_VERSION,
-        "run_id": plan.get("run_id") or ("adhoc-" + (str(plan.get("plan_id"))[:8] if plan.get("plan_id") else uuid.uuid4().hex[:8])),
-        "created_at": plan.get("created_at") or now(),
+        "receipt_protocol": receipts.V1,
+        "run_id": plan.get("run_id") or ("adhoc-" + (str(plan.get("plan_id"))[:8]
+                                                      if plan.get("plan_id") else uuid.uuid4().hex[:8])),
+        "created_at": started,
+        "started_at": started,
         "updated_at": now(),
         "plan_id": plan.get("plan_id"),
         "config_fingerprint": plan.get("config_fingerprint"),
-        "scope": {"channels": channels, "stage_order": order,
+        "scope": {"channels": channels_, "stage_order": order,
                   "platform_auth_policy": "public_only",
-                  "cities": [], "roles": [], "user_scope_explicit": False},
+                  "browser_surface": "embedded",
+                  "cities": [], "roles": [], "user_scope_explicit": False,
+                  "user_scope_confirmed": False, "narrowed_by": "unknown",
+                  "missing_stages": [], "budget": budgets.freeze(plan)},
         "current_stage": order[0] if order else "official",
         "stages": {s: {"status": "pending", "closed_at": None} for s in order},
         "tasks": [], "auth": {}, "budget_used": {}, "events": [], "derived_tasks": [],
         "scope_adjustments": [], "reports": reports or [],
     }
     for task in plan.get("tasks", []):
-        state["tasks"].append(_task_from_plan(task, channels))
+        state["tasks"].append(_task_from_plan(task, channels_))
     for task in plan.get("entry_tasks", []):
-        state["tasks"].append(_task_from_plan(task, channels, derived_from="plan.entry_tasks"))
+        state["tasks"].append(_task_from_plan(task, channels_, derived_from="plan.entry_tasks"))
     logged = {x["task_id"]: x for x in logs}
     for task in state["tasks"]:
         log = logged.get(task["task_id"])
@@ -1357,6 +1797,8 @@ def state_from_plan_logs(plan, logs, config=None, reports=None):
         task["candidate_count"] = int(log.get("candidate_count") or 0)
         task["reason"] = log.get("reason")
         task["attempts"] = 1 if status in ("success", "failed", "restricted") else 0
+        if log.get("exhausted") is not None:
+            task["exhausted"] = bool(log["exhausted"])
         task["status"] = {"success": "executed", "failed": "failed", "restricted": "blocked",
                           "budget_exhausted": "budget_exhausted"}.get(status, "pending")
         if status == "failed" and task["attempts"] < MAX_TASK_ATTEMPTS:
@@ -1365,11 +1807,7 @@ def state_from_plan_logs(plan, logs, config=None, reports=None):
 
 
 def completion_with_channels(completion, config, reports=None):
-    """补齐"配置里启用、但本轮根本没有任务"的渠道，避免被算成已完成。
-
-    这是 service 里 url=None 报告被排除在完成检查之外的修复点：渠道级缺口
-    必须显式出现在完成度里，并把 COMPLETE 降级为 PARTIAL。
-    """
+    """补齐"配置里启用、但本轮根本没有任务"的渠道，避免被算成已完成。"""
     present = {row["channel"] for row in completion["channels"]}
     reasons_by_channel = {}
     for report in reports or []:
@@ -1384,6 +1822,9 @@ def completion_with_channels(completion, config, reports=None):
         completion["channels"].append({
             "channel": channel, "stage": channel_stage(channel), "total": 0, "executed": 0,
             "blocked": 0, "skipped_by_user": 0, "budget_exhausted": 0, "pending": 0, "failed": 0,
+            "not_exhausted": 0, "scopes": 0,
+            "access_mode": channel_registry.access_mode(channel),
+            "automation_allowed": channel_registry.automation_allowed(channel),
             "auth_status": "not_required" if channel not in PLATFORM_CHANNELS else "missing",
             "auth_checked_at": None, "status": "not_covered",
             "reason": reasons_by_channel.get(channel) or "本轮未生成任务，也未执行任何动作",

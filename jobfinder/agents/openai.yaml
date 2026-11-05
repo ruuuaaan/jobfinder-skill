@@ -1,4 +1,4 @@
 interface:
   display_name: "岗位搜索与来源核验"
-  short_description: "复用已验证渠道检索指定城市岗位，核验学历与投递入口，积累企业资源并导出表格"
+  short_description: "复用已验证渠道检索指定城市岗位；本机 Chrome/Edge 登录交接，核验学历与投递入口，导出表格"
   default_prompt: "使用 $jobfinder 搜索指定城市和岗位，按我的学历及薪资条件核验原文，输出带投递入口的Excel和逐渠道结果。"

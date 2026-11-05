@@ -8,26 +8,36 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from .models import RULE_VERSION, now, SHANGHAI
 from .matching import parse_salary
+from .channels import label as channel_label
+from .channels import CHANNELS as _CHANNELS
+from .quality import statuses as quality_statuses, summary_note as quality_summary_note
 
-HEADERS = ["公司名称", "岗位名称", "岗位描述", "薪资水平", "投递链接", "工作地点原文", "规范化城市", "地域判断", "学历要求", "经验要求", "企业属性", "发布日期", "截止日期", "岗位状态", "来源渠道", "来源链接", "核验时间", "匹配结论", "待确认事项", "任职要求", "投递方式", "匹配条件", "规则版本", "原始岗位关联", "匹配计算时间"]
+HEADERS = ["公司名称", "岗位名称", "岗位描述", "薪资水平", "投递链接", "工作地点原文", "规范化城市", "地域判断", "学历要求", "经验要求", "企业属性", "发布日期", "截止日期", "岗位状态", "来源渠道", "来源链接", "核验时间", "匹配结论", "待确认事项", "任职要求", "投递方式", "匹配条件", "规则版本", "原始岗位关联", "匹配计算时间", "适配结论", "证据等级", "投递状态", "投递说明"]
 SUMMARY_HEADERS = ['公司名称','岗位名称','岗位描述','薪资水平','投递链接','工作地点','学历要求','经验要求','岗位来源','待确认说明']
 
 
 def summary_review_note(status, pending, historical=False):
-    notes=['历史记录（本次未重新核验）'] if historical else []
-    if status=='REVIEW':
-        notes.append('待确认：'+'；'.join(pending or ['信息尚未完整核验']))
-    return '\n'.join(notes)
+    """十列汇总表的末列说明。
 
-SOURCE_LABELS = {
-    'official_career': '企业官网', 'zhaopin': '智联招聘', 'boss': 'BOSS直聘',
-    'liepin': '猎聘', '51job': '前程无忧', 'bendibao_web': '本地宝网站',
-    'bendibao_wechat': '本地宝公众号', 'campus_job': '高校就业网', 'manual_import': '人工导入',
-}
+    REVIEW 写"待确认"；MATCH 也写明仍未确认的事项（例如投递入口未确认），
+    否则用户会把"条件符合"读成"可以投递"。
+    """
+    notes = ['历史记录（本次未重新核验）'] if historical else []
+    if status == 'REVIEW':
+        notes.append('待确认：' + '；'.join(pending or ['信息尚未完整核验']))
+    elif status == 'MATCH':
+        leftovers = [str(x) for x in (pending or []) if x]
+        notes.append('已核对条件，但仍有未确认事项：' + '；'.join(leftovers) if leftovers
+                     else '条件均已核对；投递需本人确认')
+    return '\n'.join(dict.fromkeys(notes))
+
+
+# 渠道中文名统一取自 channels.py：新增渠道不会在导出里显示成英文标识。
+SOURCE_LABELS = {c.name: c.label for c in _CHANNELS}
 
 
 def source_label(channel):
-    return SOURCE_LABELS.get(channel, channel or '未披露')
+    return channel_label(channel) if channel else '未披露'
 
 
 def safe_text(value):
@@ -122,7 +132,9 @@ def export_bundle(output: Path, config, jobs, results, reports, companies, disco
             if len(req)>450:
                 req = req[:450]+"…（完整原文见JSON）"
             read_at = max((e.retrieved_at for e in j.evidence), default=None)
-            rows.append([j.company,j.title,desc,j.salary_raw,j.application_url,r.geo.raw,r.geo.city,r.geo.state,j.education_raw,j.experience_raw,attrs,display_datetime(j.posted_at),display_datetime(j.deadline),j.open_status,j.source_channel,j.source_url,display_datetime(read_at),r.status,"；".join(r.pending),req,j.application_method,"；".join(f"{k}:{v.state} {v.reason}" for k,v in r.dimensions.items()),r.rule_version,r.original_job_key,display_datetime(r.checked_at)])
+            # 条件匹配、证据完整度、投递状态三件事分列，避免"MATCH"被读成"可以投递"。
+            qs = quality_statuses(r)
+            rows.append([j.company,j.title,desc,j.salary_raw,j.application_url,r.geo.raw,r.geo.city,r.geo.state,j.education_raw,j.experience_raw,attrs,display_datetime(j.posted_at),display_datetime(j.deadline),j.open_status,source_label(j.source_channel),j.source_url,display_datetime(read_at),r.status,"；".join(r.pending),req,j.application_method,"；".join(f"{k}:{v.state} {v.reason}" for k,v in r.dimensions.items()),r.rule_version,r.original_job_key,display_datetime(r.checked_at),qs["suitability"],qs["evidence"],qs["application"],qs["application_label"]])
         sheet(book, name, HEADERS, rows)
     catalog_headers = ["公司名称", "上市状态", "国有属性", "集团关系", "注册地", "总部所在地", "上市地", "官网URL", "招聘入口URL", "名单来源链接", "版本日期", "发现路径", "入口核验状态", "说明"]
     sheet(book,"企业检查清单",catalog_headers,[[str(c.get(k) or '')[:150]+'（完整证据见JSON）' if k=="notes" and len(str(c.get(k) or ''))>150 else c.get(k) for k in ["legal_name","listed_status","soe_status","group_relation","registered_location","headquarters_location","listing_location","official_url","career_url","source_url","version_date","discovery_kind","verification_status","notes"]] for c in companies])
@@ -154,8 +166,14 @@ def export_bundle(output: Path, config, jobs, results, reports, companies, disco
         conditions.append(["阶段顺序", " → ".join(completion.get("stage_order") or [])])
         if completion.get("next_action"):
             conditions.append(["下一动作", json.dumps(completion["next_action"], ensure_ascii=False)])
-        if completion.get("partial_export"):
-            conditions.append(["导出性质", "阶段性导出：未完成渠道见「运行状态与完成度」，不能当作整轮检索完成"])
+        conditions.append(["导出性质", (
+            f"阶段性导出（运行 {completion.get('run_id')}）：覆盖 {len(completion.get('stage_order') or [])} 个阶段、"
+            f"{len(completion.get('channels') or [])} 个渠道；缺口见「运行状态与完成度」，不能当作整轮检索完成"
+            if completion.get("partial_export") else
+            f"完整范围导出（运行 {completion.get('run_id')}）：仅表示声明范围完成，不代表站点全部岗位已查尽")])
+        conditions.append(["覆盖缺口", "；".join(completion.get("reasons") or []) or "无"])
+        if completion.get("scope_confirmed") is False:
+            conditions.append(["范围确认", "本轮范围未经用户确认（助手自行收窄），最终不会判为完整完成"])
         conditions.append(["边界", completion.get("boundary", "")])
     sheet(book,"检索条件与说明",["项目","说明"],conditions)
     if completion:
@@ -190,9 +208,28 @@ def export_bundle(output: Path, config, jobs, results, reports, companies, disco
         pending=r.pending or [v.reason for v in r.dimensions.values() if v.state=='UNKNOWN']
         rows.append([j.company,j.title,j.description,j.salary_raw or '未披露',
                      j.application_url or j.detail_url or j.source_url,j.location_raw or '未披露',
-                     j.education_raw or '未披露',j.experience_raw or '未披露',source_label(j.source_channel),summary_review_note(r.status,pending)])
+                     j.education_raw or '未披露',j.experience_raw or '未披露',source_label(j.source_channel),
+                     quality_summary_note(r,pending)])
     sheet(summary,'岗位汇总',SUMMARY_HEADERS,rows)
-    summary.save(output/'岗位汇总.xlsx')
+    # 文件名与说明页同时标注阶段性：主表仍是十列，解释放到独立的"导出说明"页。
+    run_id = (discovery.get("completion") or {}).get("run_id") or discovery.get("run_id") or "未记录"
+    staged = bool((discovery.get("completion") or {}).get("partial_export"))
+    summary_file = f"岗位汇总_阶段性_{run_id}.xlsx" if staged else "岗位汇总.xlsx"
+    if staged or discovery.get("completion"):
+        book_note = [
+            ["导出性质", "阶段性导出（未完成，不能当作整轮检索完成）" if staged else "完整范围导出"],
+            ["运行 ID", run_id],
+            ["完成度判定", (discovery.get("completion") or {}).get("verdict") or "未判定"],
+            ["覆盖范围", "；".join((discovery.get("completion") or {}).get("reasons") or []) or "见运行状态"],
+            ["覆盖缺口", json.dumps((discovery.get("completion") or {}).get("delivery_blockers") or [],
+                                  ensure_ascii=False)],
+            ["未完成搜索范围", json.dumps([s for s in (discovery.get("completion") or {}).get("scopes", [])
+                                     if not s.get("exhausted")], ensure_ascii=False)],
+            ["说明", "本表只覆盖上述范围；未列出的城市/岗位/渠道不代表没有岗位。投递需本人确认，本技能不自动投递。"],
+        ]
+        sheet(summary, '导出说明', ["项目", "内容"], book_note)
+    summary.save(output/summary_file)
+    discovery['summary_file'] = summary_file
     payload={"schema_version":"2.1","rule_version":config.rules_version,"generated_at":now(),"mode":mode,"config":config.model_dump(mode="json"),"effective_search_spec":spec.model_dump(mode="json"),"raw_input":(discovery.get("effective_config") or {}).get("raw_input",raw_input),"jobs":[j.model_dump(mode="json") for j in jobs],"results":[r.model_dump(mode="json") | {"salary_normalized":parse_salary(r.job)} for r in results],"counts":counts,"reports":reports,"companies":companies,"discovery":discovery,"network_events":events or []}
     payload.update(schema_version="3.2",config_fingerprint=fingerprint(config),city_statistics=city_rows,global_unique_jobs=len(jobs),global_unique_counts={s:len({r.original_job_key for r in results if r.status==s}) for s in counts},exported_at=now(),current_network_request_count=0 if discovery.get('operation')=='reexport' else len(events or []),network_events_origin='historical' if discovery.get('operation')=='reexport' else 'current_run')
     for filename, rows in [("query-log.jsonl",discovery.get("search_log",[])),("candidates.jsonl",discovery.get("candidates",[])),("network.jsonl",events or [])]:

@@ -2,9 +2,11 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from .service import ROOT, load_config, run, reexport, local_path
+from .service import (ROOT, load_config, run, reexport, run_linkedin_import,
+                      run_linkedin_browser_search, local_path)
 from .catalog import import_catalog, save_new_json, import_official_directory
-from .models import SearchConfig
+from .models import SearchConfig, now
+from .browser_backend import BrowserError
 from .planning import build_plan, effective_config, authorize_config, extend_plan, fingerprint
 from . import __version__ as SKILL_VERSION
 from .workflow import PROTOCOL_VERSION
@@ -43,6 +45,7 @@ def main():
             p.add_argument("--input",required=True)
         if name=='process-browser':
             p.add_argument('--role-reviews',help='助手依据原文填写的职能判断JSON；校验URL、原关键词、摘录与快照哈希')
+            p.add_argument('--channel',help='浏览器回执的来源渠道（默认取回执的 source_channel）')
         if name=='resume-traversal':
             p.add_argument('--budget-mode',choices=['remaining','new_run'],default='remaining',help='默认沿用剩余额度；new_run显式启用本轮配置的新一轮预算')
         if name in ('plan','extend-plan'):
@@ -60,6 +63,8 @@ def main():
     p.add_argument("--all-channels",action="store_true",help="用户选择全部支持的渠道")
     p.add_argument("--public-only",action="store_true",help="显式匿名读取模式（platform_auth_policy=public_only）")
     p.add_argument("--user-confirmed",action="store_true",help="用户已明确只要当前渠道范围；未加时收窄范围不计为完成")
+    p.add_argument("--browser-surface",choices=["external","embedded"],help="external=用户本机独立浏览器（默认，平台渠道）；embedded=显式选择 agent 内嵌预览")
+    p.add_argument("--embedded-browser",action="store_true",help="等价于 --browser-surface embedded；仅当用户明确同意内嵌预览时使用")
     p.add_argument("--run-id")
     p.add_argument("--output")
     p=commands.add_parser("channels",help="输出渠道菜单，供用户勾选（新检索第一步）")
@@ -72,6 +77,40 @@ def main():
     p.add_argument("--input",required=True); p.add_argument("--run"); p.add_argument("--output")
     p=commands.add_parser("close-stage",help="检查并关闭当前阶段")
     p.add_argument("--stage"); p.add_argument("--run"); p.add_argument("--output")
+    p=commands.add_parser("browser-status",help="本机独立浏览器能力探测（可执行文件/进程/端口）")
+    p.add_argument("--output")
+    p=commands.add_parser("browser-stop",help="关闭 JobFinder 专用浏览器进程")
+    p.add_argument("--output")
+    p=commands.add_parser("auth-open",help="在本机独立浏览器打开登录页（真实打开事件，不是打印链接）")
+    p.add_argument("--run"); p.add_argument("--channel",action="append"); p.add_argument("--output")
+    p=commands.add_parser("auth-probe",help="读取当前标签页快照并提交登录核验")
+    p.add_argument("--run"); p.add_argument("--channel",required=True); p.add_argument("--output")
+    p=commands.add_parser("auth-claim",help="用户声明已登录但核验未通过：记录声明并给出重新确认指引")
+    p.add_argument("--run"); p.add_argument("--channel",required=True)
+    p.add_argument("--note",help="用户原话或补充说明，可选"); p.add_argument("--output")
+    p=commands.add_parser("host-open",help="登记宿主浏览器（WorkBuddy 内置/扩展）已打开的登录页")
+    p.add_argument("--run"); p.add_argument("--channel",required=True)
+    p.add_argument("--browser-id",required=True); p.add_argument("--tab-id",required=True)
+    p.add_argument("--url",required=True); p.add_argument("--output")
+    p=commands.add_parser("host-probe",help="用宿主浏览器返回的可见 DOM 做登录核验")
+    p.add_argument("--run"); p.add_argument("--channel",required=True)
+    p.add_argument("--browser-id",required=True); p.add_argument("--tab-id",required=True)
+    p.add_argument("--dom",required=True,help="宿主返回的可见 DOM 文本文件")
+    p.add_argument("--url",required=True); p.add_argument("--title"); p.add_argument("--output")
+    p=commands.add_parser("linkedin-import",help="领英人工辅助：导入用户提供的岗位原文并匹配导出")
+    p.add_argument("--config",required=True); p.add_argument("--input",required=True)
+    p.add_argument("--output",required=True); p.add_argument("--allow-example",action="store_true")
+    p=commands.add_parser("linkedin-search",help="领英浏览器辅助检索：本机已登录浏览器读小样本岗位（需用户同意）")
+    p.add_argument("--config",required=True); p.add_argument("--output",required=True)
+    p.add_argument("--keyword",action="append",required=True,help="检索关键词，可重复")
+    p.add_argument("--location",required=True,help="检索地点，必须是本轮目标大陆城市")
+    p.add_argument("--run",help="绑定到已核验登录的本轮运行；预算与拦截规则沿用该运行")
+    p.add_argument("--max-details",type=int,default=3,help="详情页数量，1–5；浏览器辅助是小样本")
+    p.add_argument("--page-interval",type=float,help="页面间隔秒数，默认按平台上限")
+    p.add_argument("--user-confirmed",action="store_true",help="用户已同意由助手在本机浏览器中代为打开检索页")
+    p.add_argument("--allow-example",action="store_true")
+    p=commands.add_parser("linkedin-profile",help="输出领英访问模式与能力状态")
+    p.add_argument("--plan"); p.add_argument("--output")
     p=commands.add_parser("finalize",help="统一检查整轮状态并给出完成度")
     p.add_argument("--run"); p.add_argument("--close",action="store_true",help="可关闭的阶段自动推进后再判定")
     p.add_argument("--output")
@@ -135,8 +174,11 @@ def main():
                               'order':[c['legal_name'] for c in catalog['companies']],
                               'output':str(local_path(args.output))},ensure_ascii=False))
             return 0
-        if args.command in ('channels','start-run','auth-tabs','next-action','record-action','close-stage','finalize','gate'):
+        if args.command in ('channels','start-run','auth-tabs','next-action','record-action','close-stage','finalize','gate',
+                            'browser-status','browser-stop','auth-open','auth-probe','auth-claim',
+                            'host-open','host-probe','linkedin-profile'):
             from . import workflow
+            from . import linkedin as workflow_channels
             if args.command=='channels':
                 cfg=None
                 if args.config:
@@ -146,6 +188,27 @@ def main():
                 print(json.dumps(menu,ensure_ascii=False))
                 if args.output:
                     save_new_json(local_path(args.output),menu)
+                return 0
+            if args.command=='browser-status':
+                from .browser_backend import capability_report
+                report=capability_report(ROOT)
+                print(json.dumps(report,ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),report)
+                return 0 if report.get('status')!='unavailable' else 6
+            if args.command=='browser-stop':
+                from .browser_backend import BrowserService
+                result=BrowserService(ROOT).stop()
+                print(json.dumps(result,ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0
+            if args.command=='linkedin-profile':
+                plan=json.loads(local_path(args.plan).read_text(encoding='utf-8-sig')) if args.plan else {}
+                profile=workflow_channels.profile_from_plan(plan)
+                print(json.dumps(profile,ensure_ascii=False,indent=2))
+                if args.output:
+                    save_new_json(local_path(args.output),profile)
                 return 0
             if args.command=='start-run':
                 from .spec import matching_config
@@ -160,16 +223,24 @@ def main():
                 if missing:
                     raise ValueError('所选渠道在计划中没有任务：'+'、'.join(missing)+
                         '；请用包含这些渠道的配置重新 plan（或用 channels 命令确认可选范围）')
+                surface = args.browser_surface or ("embedded" if args.embedded_browser else None)
                 state=workflow.start_run(config,plan,ROOT,channels=picked,
                                          public_only=args.public_only,run_id=args.run_id,
-                                         user_confirmed_scope=True)
+                                         user_confirmed_scope=bool(args.user_confirmed),
+                                         browser_surface=surface)
                 scope=state['scope']
                 result={'run_id':state['run_id'],'protocol_version':PROTOCOL_VERSION,
                         'stage_order':scope['stage_order'],'channels':scope['channels'],
                         'covered_stages':scope.get('covered_stages'),
                         'missing_stages':scope.get('missing_stages'),
                         'scope_confirmed':scope.get('user_scope_confirmed'),
+                        'narrowed_by':scope.get('narrowed_by'),
                         'platform_auth_policy':scope['platform_auth_policy'],
+                        'browser_surface':scope.get('browser_surface'),
+                        'browser':state.get('browser'),
+                        'receipt_protocol':state.get('receipt_protocol'),
+                        'budget':scope.get('budget'),
+                        'linkedin':workflow_channels.access_profile() if 'linkedin' in scope['channels'] else None,
                         'tasks':len(state['tasks']),'state':str(workflow.state_file(ROOT,state['run_id'])),
                         'next':workflow.next_action(state)}
                 if scope.get('missing_stages'):
@@ -182,6 +253,7 @@ def main():
                 return 0
             state=workflow.resolve_state(ROOT,args.run)
             if args.command=='auth-tabs':
+                workflow.refresh_browser_state(state,ROOT)
                 pending=workflow.pending_auth_channels(state)
                 result={'run_id':state['run_id'],'stage':state['current_stage'],
                         'channels':pending,
@@ -191,6 +263,111 @@ def main():
                 if args.output:
                     save_new_json(local_path(args.output),result)
                 return 0
+            if args.command=='auth-open':
+                from .browser_backend import BrowserService
+                state['browser']=workflow._detect_browser(ROOT)
+                targets=args.channel or [x['channel'] for x in workflow.pending_auth_channels(state)]
+                targets=[c for c in targets if c in workflow.PLATFORM_CHANNELS]
+                if not targets:
+                    raise ValueError('本阶段没有待登录的平台；请先 next-action 确认当前阶段')
+                capability=state.get('browser') or {}
+                if capability.get('status')=='unavailable':
+                    gap={'run_id':state['run_id'],'opened':[],'capability_gap':capability,
+                         'message':('本机探测不到 Chrome/Edge：不会回退到 agent 内嵌预览。'
+                                    '请在本机安装浏览器，或提供本机连接程序；其余渠道可继续')}
+                    print(json.dumps(gap,ensure_ascii=False))
+                    workflow.save_state(state,ROOT)
+                    return 6
+                service=BrowserService(ROOT)
+                opened=[]
+                for name in targets:
+                    handle=service.open(workflow.login_url(name))
+                    workflow.record_action(state,{'action':'auth_open','channel':name,
+                        'browser_session_id':handle['session_id'],'tab_id':handle['target_id'],
+                        'surface':handle['surface'],'pid':handle.get('pid'),
+                        'profile_dir':handle.get('profile_dir'),
+                        'login_url':workflow.login_url(name),'opened_at':now()},ROOT)
+                    opened.append({'channel':name,'tab_id':handle['target_id'],
+                                   'browser_session_id':handle['session_id'],
+                                   'login_url':workflow.login_url(name)})
+                result={'run_id':state['run_id'],'opened':opened,
+                        'browser_session_id':opened[0]['browser_session_id'] if opened else None,
+                        'message':'已在本机独立浏览器打开登录页；请用户分别登录后运行 auth-probe'}
+                print(json.dumps(result,ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0
+            if args.command=='auth-probe':
+                from .browser_backend import BrowserService
+                channel=args.channel
+                record=(state.get('auth') or {}).get(channel) or {}
+                if not (record.get('opened_event') or {}).get('tab_id'):
+                    raise ValueError('该渠道还没有真实的浏览器打开事件：请先运行 auth-open')
+                try:
+                    snapshot=BrowserService(ROOT).snapshot(record['tab_id'])
+                except BrowserError as exc:
+                    # 标签页被关/浏览器重建：原登录态失效，任务保持 pending，等用户重新登录。
+                    workflow.invalidate_auth(state,channel,f'浏览器标签页不可用：{exc}')
+                    workflow.save_state(state,ROOT)
+                    result={'run_id':state['run_id'],'channel':channel,'status':'failed',
+                            'problems':[str(exc)],'next':workflow.next_action(state),
+                            'message':'标签页已关闭或浏览器会话已重建，登录态失效；请重新运行 auth-open'}
+                    print(json.dumps(result,ensure_ascii=False))
+                    if args.output:
+                        save_new_json(local_path(args.output),result)
+                    return 6
+                run_dir=workflow.state_file(ROOT,state['run_id']).parent/'auth'
+                path=BrowserService(ROOT).write_snapshot(snapshot,run_dir)
+                result=workflow.record_action(state,{'action':'auth_probe','channel':channel,
+                    'browser_session_id':snapshot.get('session_id') or record.get('backend_session_id'),
+                    'browser_context_id':record.get('backend_session_id'),
+                    'tab_id':record['tab_id'],'snapshot_path':str(path),
+                    'url':snapshot.get('url'),'dom_hash':snapshot.get('content_hash'),
+                    'session_scope':'browser_visible_dom'},ROOT)
+                print(json.dumps({'run_id':state['run_id'],'channel':channel,'result':result,
+                                  'snapshot':str(path),'url':snapshot.get('url')},ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0 if result.get('status')=='verified' else 6
+            if args.command=='auth-claim':
+                result=workflow.record_action(state,{'action':'user_claimed_login',
+                    'channel':args.channel,'reason':args.note},ROOT)
+                print(json.dumps({'run_id':state['run_id'],'channel':args.channel,'result':result,
+                                  'next':workflow.next_action(state)},ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0
+            if args.command=='host-open':
+                result=workflow.record_action(state,{'action':'auth_open','channel':args.channel,
+                    'browser_session_id':f'host:{args.browser_id}',
+                    'browser_context_id':f'host:{args.browser_id}',
+                    'tab_id':str(args.tab_id),'surface':'external_browser',
+                    'backend':'host_browser','browser_id':args.browser_id,
+                    'login_url':args.url},ROOT)
+                print(json.dumps({'run_id':state['run_id'],'channel':args.channel,'result':result,
+                                  'next':workflow.next_action(state)},ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0
+            if args.command=='host-probe':
+                from . import platform_auth
+                dom=local_path(args.dom).read_text(encoding='utf-8-sig',errors='replace')
+                run_dir=workflow.state_file(ROOT,state['run_id']).parent/'auth'
+                run_dir.mkdir(parents=True,exist_ok=True)
+                snap=platform_auth.build_host_snapshot(
+                    dom,url=args.url,title=args.title or '',host_tool='workbuddy_browser',
+                    browser_id=args.browser_id,tab_id=args.tab_id)
+                target=run_dir/f"host-dom-{workflow.now().replace(':','').replace('-','')[:15]}.json"
+                target.write_text(json.dumps(snap,ensure_ascii=False,indent=1),encoding='utf-8')
+                result=workflow.record_action(state,{'action':'auth_probe','channel':args.channel,
+                    'backend':'host_browser','browser_id':args.browser_id,
+                    'tab_id':str(args.tab_id),'snapshot_path':str(target),'url':args.url,
+                    'session_scope':'browser_visible_dom'},ROOT)
+                print(json.dumps({'run_id':state['run_id'],'channel':args.channel,'result':result,
+                                  'snapshot':str(target)},ensure_ascii=False))
+                if args.output:
+                    save_new_json(local_path(args.output),result)
+                return 0 if result.get('status')=='verified' else 6
             if args.command=='gate':
                 comp=workflow.finalize(state,workspace=ROOT)
                 payload={'run_id':state['run_id'],'allowed':comp.get('delivery_allowed'),
@@ -199,6 +376,7 @@ def main():
                 print(json.dumps(payload,ensure_ascii=False))
                 return 0 if payload['allowed'] else 5
             if args.command=='next-action':
+                workflow.refresh_browser_state(state,ROOT)
                 action=workflow.next_action(state)
                 workflow.save_state(state,ROOT)
                 print(json.dumps({'run_id':state['run_id'],'action':action},ensure_ascii=False))
@@ -233,9 +411,9 @@ def main():
                 return 0 if completion['verdict'] in ('COMPLETE','PARTIAL') else 4
         raw=json.loads(local_path(args.config).read_text(encoding="utf-8-sig"))
         overrides={}
-        if args.city is not None:
+        if getattr(args,'city',None) is not None:
             overrides["target_cities"]=args.city
-        if args.role is not None:
+        if getattr(args,'role',None) is not None:
             overrides["role_keywords"]=args.role
             overrides["role_mode"]="keywords"
         from .spec import matching_config
@@ -264,6 +442,45 @@ def main():
                               'tasks':[t for t in result['tasks'] if t.get('reason')=='official_channel_company_search'],
                               'output':str(local_path(args.output))},ensure_ascii=False))
             return 0
+        if args.command=='linkedin-search':
+            authorize_config(config,args.allow_example,False)
+            effective=effective_config(config,args.config,overrides)
+            effective["raw_input"]={"config":raw,"overrides":overrides}
+            result=run_linkedin_browser_search(
+                config,args.output,keywords=args.keyword,location=args.location,
+                run_id=args.run,max_details=args.max_details,workspace=ROOT,
+                user_confirmed=args.user_confirmed,effective=effective,
+                page_interval=args.page_interval)
+            completion=result['discovery'].get('completion') or {}
+            summary=result['discovery'].get('linkedin_browser_search') or {}
+            print(json.dumps({"mode":result["mode"],"jobs_extracted":len(result['jobs']),
+                              "counts":result["counts"],"verdict":completion.get("verdict"),
+                              "run_id":completion.get("run_id"),
+                              "pages_read":summary.get("pages_read"),
+                              "checkpoint":summary.get("checkpoint"),
+                              "login_required":summary.get("login_required"),
+                              "problems":summary.get("problems"),
+                              "summary_file":result['discovery'].get('summary_file'),
+                              "output":str(local_path(args.output))},ensure_ascii=False))
+            if summary.get("checkpoint"):
+                print("领英出现安全检查/验证码：已停止自动操作，请用户在本机浏览器处理后重试", file=sys.stderr)
+                return 6
+            if summary.get("login_required"):
+                print("领英当前会话未登录：请先 auth-open → 用户登录 → auth-probe，再重试检索", file=sys.stderr)
+                return 6
+            return 0 if result['jobs'] else 5
+        if args.command=='linkedin-import':
+            authorize_config(config,args.allow_example,False)
+            effective=effective_config(config,args.config,overrides)
+            effective["raw_input"]={"config":raw,"overrides":overrides}
+            result=run_linkedin_import(config,args.input,args.output,effective)
+            completion=result['discovery'].get('completion') or {}
+            print(json.dumps({"mode":result["mode"],"jobs_extracted":len(result['jobs']),
+                              "counts":result["counts"],"verdict":completion.get("verdict"),
+                              "run_id":completion.get("run_id"),
+                              "summary_file":result['discovery'].get('summary_file'),
+                              "output":str(local_path(args.output))},ensure_ascii=False))
+            return 0 if result['jobs'] else 5
         effective=effective_config(config,args.config,overrides)
         effective["raw_input"]={"config":raw,"overrides":overrides}
         print(json.dumps({"effective_config":effective},ensure_ascii=False))
@@ -301,7 +518,7 @@ def main():
             return 0
         if args.command=='process-browser':
             from .browser import process_browser_run
-            result=process_browser_run(config,local_path(args.input),local_path(args.output),ROOT/'data/resources/companies.sqlite3',role_reviews_path=local_path(args.role_reviews) if args.role_reviews else None,run_id=args.run,workspace=ROOT)
+            result=process_browser_run(config,local_path(args.input),local_path(args.output),ROOT/'data/resources/companies.sqlite3',role_reviews_path=local_path(args.role_reviews) if args.role_reviews else None,run_id=args.run,workspace=ROOT,channel=getattr(args,'channel',None))
         elif args.command=="export":
             result=reexport(config,args.input,args.output,effective)
         elif args.command=='resume-traversal':
@@ -313,7 +530,7 @@ def main():
         completion=result["discovery"].get("completion") or {}
         print(json.dumps({"mode":result["mode"],"jobs_extracted":0 if args.command=='export' else len(result['jobs']),"jobs_in_evidence":len(result["jobs"]),"counts":result["counts"],"discovery":result["discovery"]["status"],"verdict":completion.get("verdict"),"run_id":completion.get("run_id"),"unfinished":[u["task_id"] for u in completion.get("unfinished",[])][:20],"output":str(local_path(args.output))},ensure_ascii=False))
         return 3 if args.command=="search" and result["discovery"]["status"]=="unconfigured" else 0
-    except (ValueError, OSError, KeyError) as exc:
+    except (ValueError, OSError, KeyError, BrowserError) as exc:
         print("JobFinder错误："+str(exc),file=sys.stderr)
         return 2
 
