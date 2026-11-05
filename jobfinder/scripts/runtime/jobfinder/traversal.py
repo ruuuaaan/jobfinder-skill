@@ -34,7 +34,7 @@ def page_proof(page, url):
 def load_proof(proof):
     path=Path(proof.get('snapshot') or '').resolve()
     from .paths import WORKSPACE as root
-    if not path.is_relative_to(root) or not path.is_file():
+    if not path.is_relative_to(Path(root).resolve()) or not path.is_file():
         raise FetchError('progress_evidence_missing','恢复需要项目内的原页面快照')
     data=path.read_bytes()
     if hashlib.sha256(data).hexdigest()!=proof.get('hash'):

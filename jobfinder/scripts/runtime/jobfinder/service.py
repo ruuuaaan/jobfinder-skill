@@ -27,16 +27,23 @@ from . import access_control
 from .paths import WORKSPACE as ROOT
 
 
-def local_path(path, base=ROOT):
-    p = (base / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
-    if not p.is_relative_to(ROOT):
+def _root():
+    """ROOT 可能是带 junction 或 8.3 短名的写法（例如 CI 的 `C:\\Users\\RUNNER~1`），
+    比较前必须归一化，否则同一目录会被判成"工作区之外"。"""
+    return Path(ROOT).resolve()
+
+
+def local_path(path, base=None):
+    anchor = Path(base) if base is not None else Path(ROOT)
+    p = (anchor / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
+    if not p.is_relative_to(_root()):
         raise ValueError("本阶段只读取项目内显式提供的文件，请先将有权使用的材料复制到项目")
     return p
 
 
 def output_path(path, mode):
     p = local_path(path)
-    expected = ROOT / "outputs" / mode
+    expected = _root() / "outputs" / mode
     if not p.is_relative_to(expected) or p == expected:
         raise ValueError(f"输出必须位于 outputs/{mode}/<独立运行目录>，不得混用模拟与真实结果")
     if p.exists() and any(p.iterdir()):

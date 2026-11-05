@@ -3,7 +3,7 @@ name: jobfinder
 description: 检索中国大陆指定城市的岗位，复用企业官网、招聘站列表页直读与站内搜索、人才服务平台、本地宝网站及公众号等已实测渠道的方法，核验岗位原文、学历门槛与投递入口，维护企业资源库并导出Excel。支持新检索、刷新和公告反查企业；不自动投递。
 license: MIT
 metadata:
-  version: "0.6.2"
+  version: "0.6.3"
   compatibility: "Python 3.11+; file and terminal tools; host search/browser for live collection."
 ---
 

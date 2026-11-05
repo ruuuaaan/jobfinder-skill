@@ -65,7 +65,7 @@ def attach_city_evidence(jobs,doc,contract):
         return
     from .paths import WORKSPACE as root
     path=Path(contract.get('snapshot','')).resolve()
-    if not path.is_relative_to(root) or not path.is_file():
+    if not path.is_relative_to(Path(root).resolve()) or not path.is_file():
         return
     data=path.read_bytes()
     if hashlib.sha256(data).hexdigest()!=contract.get('content_hash'):

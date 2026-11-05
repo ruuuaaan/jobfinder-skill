@@ -1,5 +1,29 @@
 # 变更与发布清单
 
+## 0.6.3（2026-11-05）
+
+修一个只在 Windows CI 上暴露的路径判定缺陷：`service.local_path()` 只 `resolve()` 待检路径，
+没有 `resolve()` 工作区根，于是同一目录的两种写法被判成"项目之外"。
+
+### 修复
+
+- `service._root()`：比较前把 `ROOT` 一起归一化。GitHub Actions 的 Windows runner 把 `%TEMP%`
+  写成 `C:\Users\RUNNER~1\...`，`resolve()` 展开成 `runneradmin`，`outputs/real/<run>` 就被判越界，
+  领英浏览器检索的 5 个用例在 Windows 上全红（Ubuntu 正常）。
+- 同一写法在 `moka.attach_city_evidence()` 与 `traversal.load_proof()` 一并改掉：
+  这是"工作区放在 junction / 8.3 短名下就静默失效"的同一类隐患，不是 Windows 专属。
+
+### 测试
+
+- 新增 `jobfinder/tests/test_workspace_paths.py`：用目录别名复现"同一目录两种写法"
+  （优先符号链接，Windows 上退回 junction，免管理员），断言别名下的输出目录可用、越界仍被拒绝。
+  已确认回退修复后该用例会失败，不是空跑。
+- 全量 119 例通过（原 118 例）。
+
+### CI
+
+- 单测失败块转成 GitHub 注解（`scripts/ci_report.py`），失败时不用开日志页也能看到用例名与断言文本。
+
 ## 0.6.2（2026-11-05）
 
 补上"用户明明已登录、核验却判没登录"这条断链：平台渠道新增**宿主浏览器通道**，
